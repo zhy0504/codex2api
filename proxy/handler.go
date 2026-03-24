@@ -209,12 +209,18 @@ func (h *Handler) Responses(c *gin.Context) {
 		})
 	}
 
+	// 将 Chat Completions 风格的 reasoning_effort 自动转换为 Responses API 的 reasoning.effort
+	if re := gjson.GetBytes(codexBody, "reasoning_effort"); re.Exists() && !gjson.GetBytes(codexBody, "reasoning.effort").Exists() {
+		codexBody, _ = sjson.SetBytes(codexBody, "reasoning.effort", re.String())
+	}
+
 	// 删除 Codex 不支持的参数（客户端可能传入）
 	unsupportedFields := []string{
 		"max_output_tokens", "max_tokens", "max_completion_tokens",
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
 		"logprobs", "top_logprobs", "n", "seed", "stop", "user",
 		"logit_bias", "response_format", "service_tier", "stream_options",
+		"reasoning_effort",
 	}
 	for _, field := range unsupportedFields {
 		codexBody, _ = sjson.DeleteBytes(codexBody, field)
