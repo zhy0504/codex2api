@@ -1,6 +1,6 @@
 import type { PropsWithChildren, ReactNode } from 'react'
 import { NavLink } from 'react-router-dom'
-import { LayoutDashboard, Users, Activity, Settings, Server } from 'lucide-react'
+import { LayoutDashboard, Users, Activity, Settings, Server, Workflow } from 'lucide-react'
 import logoImg from '../assets/logo.png'
 
 type NavItem = {
@@ -14,6 +14,7 @@ const navItems: NavItem[] = [
   { to: '/', label: '仪表盘', icon: <LayoutDashboard className="size-[18px]" />, end: true },
   { to: '/accounts', label: '账号管理', icon: <Users className="size-[18px]" /> },
   { to: '/ops', label: '系统运维', icon: <Server className="size-[18px]" /> },
+  { to: '/ops/scheduler', label: '调度面板', icon: <Workflow className="size-[18px]" /> },
   { to: '/usage', label: '使用统计', icon: <Activity className="size-[18px]" /> },
   { to: '/settings', label: '系统设置', icon: <Settings className="size-[18px]" /> },
 ]
@@ -94,7 +95,7 @@ export default function Layout({ children }: PropsWithChildren) {
         </main>
 
         {/* Mobile bottom nav */}
-        <nav className="fixed left-4 right-4 bottom-4 z-40 hidden max-lg:grid grid-cols-5 gap-2 p-2 border border-border rounded-3xl bg-white/90 shadow-lg backdrop-blur-[20px]" aria-label="移动导航">
+        <nav className="fixed left-4 right-4 bottom-4 z-40 hidden max-lg:grid grid-cols-6 gap-2 p-2 border border-border rounded-3xl bg-white/90 shadow-lg backdrop-blur-[20px]" aria-label="移动导航">
           {navItems.map((item) => (
             <NavLink
               key={item.to}
