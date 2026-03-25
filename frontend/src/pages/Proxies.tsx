@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
-import { Globe, Plus, Trash2, Play, MapPin, Loader2, Zap, ChevronLeft, ChevronRight } from 'lucide-react'
+import { Globe, Plus, Trash2, Play, MapPin, Loader2, Zap, ChevronLeft, ChevronRight, Eye, EyeOff } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { api, type ProxyRow, type ProxyTestResult } from '../api'
 
@@ -20,6 +20,17 @@ function latencyBg(ms: number): string {
   return 'bg-red-500/10'
 }
 
+function maskUrl(url: string): string {
+  try {
+    const u = new URL(url)
+    const host = u.hostname
+    const masked = host.length > 6 ? host.slice(0, 3) + '***' + host.slice(-3) : '***'
+    return `${u.protocol}//${u.username ? '***:***@' : ''}${masked}${u.port ? ':' + u.port : ''}`
+  } catch {
+    return url.slice(0, 10) + '******'
+  }
+}
+
 export default function Proxies() {
   const { t } = useTranslation()
   const [proxies, setProxies] = useState<ProxyRow[]>([])
@@ -33,6 +44,7 @@ export default function Proxies() {
   const [testingIds, setTestingIds] = useState<Set<number>>(new Set())
   const [testAllLoading, setTestAllLoading] = useState(false)
   const [page, setPage] = useState(1)
+  const [revealedIds, setRevealedIds] = useState<Set<number>>(new Set())
 
   const reload = useCallback(async () => {
     try {
@@ -48,7 +60,6 @@ export default function Proxies() {
   const totalPages = Math.max(1, Math.ceil(proxies.length / PAGE_SIZE))
   const pagedProxies = proxies.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
 
-  // Reset page if it goes out of bounds
   useEffect(() => {
     if (page > totalPages) setPage(totalPages)
   }, [page, totalPages])
@@ -105,7 +116,6 @@ export default function Proxies() {
     try {
       const result = await api.testProxy(p.url, p.id)
       if (result.success) {
-        // Update local state immediately
         setProxies(prev => prev.map(px =>
           px.id === p.id
             ? { ...px, test_ip: result.ip || '', test_location: result.location || '', test_latency_ms: result.latency_ms || 0 }
@@ -122,7 +132,6 @@ export default function Proxies() {
 
   const handleTestAll = async () => {
     setTestAllLoading(true)
-    // Test each proxy sequentially (ip-api rate limit = 45/min)
     for (const p of proxies) {
       setTestingIds(prev => new Set(prev).add(p.id))
       try {
@@ -161,13 +170,6 @@ export default function Proxies() {
     }
   }
 
-  const formatTime = (iso: string) => {
-    const d = new Date(iso)
-    const offset = 8 * 60
-    const beijing = new Date(d.getTime() + (offset + d.getTimezoneOffset()) * 60 * 1000)
-    return `${beijing.getFullYear()}-${String(beijing.getMonth() + 1).padStart(2, '0')}-${String(beijing.getDate()).padStart(2, '0')} ${String(beijing.getHours()).padStart(2, '0')}:${String(beijing.getMinutes()).padStart(2, '0')}`
-  }
-
   const enabledCount = proxies.filter(p => p.enabled).length
   const canEnable = enabledCount > 0
 
@@ -181,14 +183,14 @@ export default function Proxies() {
             {t('nav.proxies')}
           </h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            管理代理池，支持轮询分配给账号使用
+            {t('proxies.description')}
           </p>
         </div>
         <div className="flex items-center gap-3">
           {/* Pool Toggle Switch */}
-          <div className="flex items-center gap-3" title={!canEnable && !poolEnabled ? '请先添加至少一个代理' : undefined}>
+          <div className="flex items-center gap-3" title={!canEnable && !poolEnabled ? t('proxies.addFirstProxy') : undefined}>
             <span className={`text-sm font-medium ${poolEnabled ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'}`}>
-              {poolEnabled ? '代理池已启用' : '代理池已关闭'}
+              {poolEnabled ? t('proxies.poolEnabled') : t('proxies.poolDisabled')}
             </span>
             <button
               role="switch"
@@ -209,7 +211,7 @@ export default function Proxies() {
               className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold bg-destructive/10 border border-destructive/30 text-destructive hover:bg-destructive/20 transition-all"
             >
               <Trash2 className="size-4" />
-              删除 ({selected.size})
+              {t('proxies.deleteSelected', { count: selected.size })}
             </button>
           )}
 
@@ -220,7 +222,7 @@ export default function Proxies() {
               className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold border border-border text-foreground hover:bg-muted/50 transition-all disabled:opacity-50"
             >
               {testAllLoading ? <Loader2 className="size-4 animate-spin" /> : <Zap className="size-4" />}
-              {testAllLoading ? '测试中...' : '一键测试'}
+              {testAllLoading ? t('proxies.testingAll') : t('proxies.testAll')}
             </button>
           )}
 
@@ -229,7 +231,7 @@ export default function Proxies() {
             className="flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold bg-primary text-primary-foreground hover:opacity-90 transition-opacity shadow-sm"
           >
             <Plus className="size-4" />
-            添加代理
+            {t('proxies.addProxy')}
           </button>
         </div>
       </div>
@@ -238,9 +240,9 @@ export default function Proxies() {
       {showAdd && (
         <Card className="py-0">
           <CardContent className="p-6 space-y-4">
-            <h4 className="text-base font-semibold text-foreground">添加代理</h4>
+            <h4 className="text-base font-semibold text-foreground">{t('proxies.addProxyTitle')}</h4>
             <p className="text-sm text-muted-foreground">
-              每行一个代理 URL，支持 http:// / https:// / socks5:// 格式
+              {t('proxies.addProxyDesc')}
             </p>
             <textarea
               value={addInput}
@@ -253,7 +255,7 @@ export default function Proxies() {
                 type="text"
                 value={addLabel}
                 onChange={e => setAddLabel(e.target.value)}
-                placeholder={'标签 (可选, 如 "美国", "日本")'}
+                placeholder={t('proxies.labelPlaceholder')}
                 className="flex-1 px-3 py-2 text-sm rounded-xl border border-border bg-background text-foreground placeholder:text-muted-foreground outline-none focus:ring-2 focus:ring-primary/30"
               />
               <button
@@ -261,7 +263,7 @@ export default function Proxies() {
                 disabled={addLoading || !addInput.trim()}
                 className="px-5 py-2 rounded-xl text-sm font-semibold bg-primary text-primary-foreground hover:opacity-90 transition-opacity disabled:opacity-50 shadow-sm"
               >
-                {addLoading ? '添加中...' : '确认添加'}
+                {addLoading ? t('proxies.adding') : t('proxies.confirmAdd')}
               </button>
             </div>
           </CardContent>
@@ -273,21 +275,21 @@ export default function Proxies() {
         <Card className="py-0">
           <CardContent className="p-4 text-center">
             <div className="text-2xl font-bold text-foreground">{proxies.length}</div>
-            <div className="text-xs text-muted-foreground mt-1">总代理数</div>
+            <div className="text-xs text-muted-foreground mt-1">{t('proxies.totalProxies')}</div>
           </CardContent>
         </Card>
         <Card className="py-0">
           <CardContent className="p-4 text-center">
             <div className="text-2xl font-bold text-emerald-600 dark:text-emerald-400">{enabledCount}</div>
-            <div className="text-xs text-muted-foreground mt-1">已启用</div>
+            <div className="text-xs text-muted-foreground mt-1">{t('proxies.enabledCount')}</div>
           </CardContent>
         </Card>
         <Card className="py-0">
           <CardContent className="p-4 text-center">
             <div className={`text-2xl font-bold ${poolEnabled ? 'text-emerald-600 dark:text-emerald-400' : 'text-muted-foreground'}`}>
-              {poolEnabled ? '轮询模式' : '关闭'}
+              {poolEnabled ? t('proxies.roundRobin') : t('proxies.off')}
             </div>
-            <div className="text-xs text-muted-foreground mt-1">代理池状态</div>
+            <div className="text-xs text-muted-foreground mt-1">{t('proxies.poolStatus')}</div>
           </CardContent>
         </Card>
       </div>
@@ -302,8 +304,8 @@ export default function Proxies() {
           ) : proxies.length === 0 ? (
             <div className="text-center py-16 text-muted-foreground">
               <Globe className="size-12 mx-auto mb-3 opacity-30" />
-              <p className="text-sm font-medium">暂无代理</p>
-              <p className="text-xs mt-1">点击「添加代理」开始配置代理池</p>
+              <p className="text-sm font-medium">{t('proxies.noProxies')}</p>
+              <p className="text-xs mt-1">{t('proxies.noProxiesDesc')}</p>
             </div>
           ) : (
             <>
@@ -314,12 +316,12 @@ export default function Proxies() {
                       <th className="p-3 w-10">
                         <input type="checkbox" checked={allSelected} onChange={toggleSelectAll} className="size-4 rounded" />
                       </th>
-                      <th className="p-3 font-semibold">代理 URL</th>
-                      <th className="p-3 font-semibold">状态</th>
-                      <th className="p-3 font-semibold">地址</th>
-                      <th className="p-3 font-semibold">IP</th>
-                      <th className="p-3 font-semibold">延迟</th>
-                      <th className="p-3 font-semibold text-right">操作</th>
+                      <th className="p-3 font-semibold">{t('proxies.colUrl')}</th>
+                      <th className="p-3 font-semibold">{t('proxies.colStatus')}</th>
+                      <th className="p-3 font-semibold">{t('proxies.colLocation')}</th>
+                      <th className="p-3 font-semibold">{t('proxies.colIp')}</th>
+                      <th className="p-3 font-semibold">{t('proxies.colLatency')}</th>
+                      <th className="p-3 font-semibold text-right">{t('proxies.colActions')}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -340,7 +342,27 @@ export default function Proxies() {
                               className="size-4 rounded"
                             />
                           </td>
-                          <td className="p-3 font-mono text-[20px] font-bold break-all max-w-[380px] text-foreground">{p.url}</td>
+                          <td className="p-3 max-w-[380px]">
+                            <div className="flex items-center gap-2">
+                              <button
+                                onClick={() => {
+                                  setRevealedIds(prev => {
+                                    const next = new Set(prev)
+                                    if (next.has(p.id)) next.delete(p.id)
+                                    else next.add(p.id)
+                                    return next
+                                  })
+                                }}
+                                className="shrink-0 flex items-center justify-center size-6 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-all"
+                                title={revealedIds.has(p.id) ? 'Hide' : 'Show'}
+                              >
+                                {revealedIds.has(p.id) ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
+                              </button>
+                              <span className="font-mono text-[20px] font-bold break-all text-foreground">
+                                {revealedIds.has(p.id) ? p.url : maskUrl(p.url)}
+                              </span>
+                            </div>
+                          </td>
                           <td className="p-3">
                             <button
                               onClick={() => handleToggle(p)}
@@ -351,7 +373,7 @@ export default function Proxies() {
                               }`}
                             >
                               <span className={`size-1.5 rounded-full ${p.enabled ? 'bg-emerald-500' : 'bg-muted-foreground/50'}`} />
-                              {p.enabled ? '启用' : '禁用'}
+                              {p.enabled ? t('proxies.enabled') : t('proxies.disabled')}
                             </button>
                           </td>
                           {/* Location */}
@@ -359,9 +381,9 @@ export default function Proxies() {
                             {isTesting ? (
                               <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
                             ) : p.test_location ? (
-                              <div className="flex items-center gap-1 text-xs font-medium text-foreground">
+                              <div className="flex items-center gap-1 text-xs font-medium text-foreground whitespace-nowrap">
                                 <MapPin className="size-3 text-primary shrink-0" />
-                                <span className="truncate max-w-[160px]">{p.test_location}</span>
+                                {p.test_location}
                               </div>
                             ) : (
                               <span className="text-xs text-muted-foreground">-</span>
@@ -370,7 +392,7 @@ export default function Proxies() {
                           {/* IP */}
                           <td className="p-3">
                             {p.test_ip ? (
-                              <span className="text-[20px] font-mono font-bold text-foreground">{p.test_ip}</span>
+                              <span className="text-[20px] font-mono font-bold text-foreground whitespace-nowrap">{p.test_ip}</span>
                             ) : (
                               <span className="text-xs text-muted-foreground">-</span>
                             )}
@@ -391,15 +413,15 @@ export default function Proxies() {
                                 onClick={() => handleTest(p)}
                                 disabled={isTesting}
                                 className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-border text-foreground hover:bg-muted/50 transition-all disabled:opacity-50"
-                                title="测试代理"
+                                title={t('proxies.testProxy')}
                               >
                                 {isTesting ? <Loader2 className="size-3.5 animate-spin" /> : <Play className="size-3.5" />}
-                                测试
+                                {t('proxies.test')}
                               </button>
                               <button
                                 onClick={() => handleDelete(p.id)}
                                 className="flex items-center justify-center size-7 rounded-lg text-destructive hover:bg-destructive/10 transition-all"
-                                title="删除"
+                                title={t('common.delete')}
                               >
                                 <Trash2 className="size-3.5" />
                               </button>
@@ -416,7 +438,7 @@ export default function Proxies() {
               {totalPages > 1 && (
                 <div className="flex items-center justify-between px-4 py-3 border-t border-border">
                   <span className="text-xs text-muted-foreground">
-                    共 {proxies.length} 个代理，第 {page}/{totalPages} 页
+                    {t('proxies.pagination', { total: proxies.length, page, totalPages })}
                   </span>
                   <div className="flex items-center gap-1">
                     <button
