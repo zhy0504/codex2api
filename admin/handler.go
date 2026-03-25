@@ -30,17 +30,27 @@ type Handler struct {
 	startedAt     time.Time
 	pgMaxConns    int
 	redisPoolSize int
+
+	// 图表聚合内存缓存（10秒 TTL）
+	chartCacheMu   sync.RWMutex
+	chartCacheData map[string]*chartCacheEntry
+}
+
+type chartCacheEntry struct {
+	data      *database.ChartAggregation
+	expiresAt time.Time
 }
 
 // NewHandler 创建管理后台处理器
 func NewHandler(store *auth.Store, db *database.DB, tc *cache.TokenCache, rl *proxy.RateLimiter) *Handler {
 	return &Handler{
-		store:       store,
-		cache:       tc,
-		db:          db,
-		rateLimiter: rl,
-		cpuSampler:  newCPUSampler(),
-		startedAt:   time.Now(),
+		store:          store,
+		cache:          tc,
+		db:             db,
+		rateLimiter:    rl,
+		cpuSampler:     newCPUSampler(),
+		startedAt:      time.Now(),
+		chartCacheData: make(map[string]*chartCacheEntry),
 	}
 }
 
@@ -66,6 +76,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/clean-rate-limited", h.CleanRateLimited)
 	api.GET("/usage/stats", h.GetUsageStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
+	api.GET("/usage/chart-data", h.GetChartData)
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
 	api.GET("/keys", h.ListAPIKeys)
 	api.POST("/keys", h.CreateAPIKey)
@@ -554,6 +565,59 @@ func (h *Handler) GetUsageStats(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, stats)
+}
+
+// GetChartData 返回图表聚合数据（服务端分桶 + 内存缓存）
+func (h *Handler) GetChartData(c *gin.Context) {
+	startStr := c.Query("start")
+	endStr := c.Query("end")
+	bucketStr := c.DefaultQuery("bucket_minutes", "5")
+
+	startTime, e1 := time.Parse(time.RFC3339, startStr)
+	endTime, e2 := time.Parse(time.RFC3339, endStr)
+	if e1 != nil || e2 != nil {
+		writeError(c, http.StatusBadRequest, "start/end 参数格式错误，需要 RFC3339 格式")
+		return
+	}
+	bucketMinutes, _ := strconv.Atoi(bucketStr)
+	if bucketMinutes < 1 {
+		bucketMinutes = 5
+	}
+
+	// 检查内存缓存（10秒 TTL）
+	cacheKey := fmt.Sprintf("%s|%s|%d", startStr, endStr, bucketMinutes)
+	h.chartCacheMu.RLock()
+	if entry, ok := h.chartCacheData[cacheKey]; ok && time.Now().Before(entry.expiresAt) {
+		h.chartCacheMu.RUnlock()
+		c.JSON(http.StatusOK, entry.data)
+		return
+	}
+	h.chartCacheMu.RUnlock()
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	result, err := h.db.GetChartAggregation(ctx, startTime, endTime, bucketMinutes)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+
+	// 写入缓存
+	h.chartCacheMu.Lock()
+	h.chartCacheData[cacheKey] = &chartCacheEntry{
+		data:      result,
+		expiresAt: time.Now().Add(10 * time.Second),
+	}
+	// 清理过期条目（延迟清理，避免内存泄漏）
+	for k, v := range h.chartCacheData {
+		if time.Now().After(v.expiresAt) {
+			delete(h.chartCacheData, k)
+		}
+	}
+	h.chartCacheMu.Unlock()
+
+	c.JSON(http.StatusOK, result)
 }
 
 // GetUsageLogs 获取使用日志

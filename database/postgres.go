@@ -657,6 +657,106 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 	return logs, rows.Err()
 }
 
+// ==================== 图表聚合（服务端） ====================
+
+// ChartTimelinePoint 时间轴聚合点
+type ChartTimelinePoint struct {
+	Bucket          string  `json:"bucket"`
+	Requests        int64   `json:"requests"`
+	AvgLatency      float64 `json:"avg_latency"`
+	InputTokens     int64   `json:"input_tokens"`
+	OutputTokens    int64   `json:"output_tokens"`
+	ReasoningTokens int64   `json:"reasoning_tokens"`
+	CachedTokens    int64   `json:"cached_tokens"`
+}
+
+// ChartModelPoint 模型排行聚合点
+type ChartModelPoint struct {
+	Model    string `json:"model"`
+	Requests int64  `json:"requests"`
+}
+
+// ChartAggregation 仪表盘图表聚合结果
+type ChartAggregation struct {
+	Timeline []ChartTimelinePoint `json:"timeline"`
+	Models   []ChartModelPoint    `json:"models"`
+}
+
+// GetChartAggregation 在数据库层完成图表数据的分桶聚合（无需传输原始行）
+func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, bucketMinutes int) (*ChartAggregation, error) {
+	if bucketMinutes < 1 {
+		bucketMinutes = 5
+	}
+	result := &ChartAggregation{}
+
+	// 时间轴聚合：按 bucketMinutes 分桶
+	timelineQuery := `
+	SELECT
+		TO_CHAR(
+			date_trunc('minute', created_at)
+			- (EXTRACT(MINUTE FROM created_at)::int % $3) * INTERVAL '1 minute',
+			'YYYY-MM-DD"T"HH24:MI:SS'
+		) AS bucket,
+		COUNT(*)                              AS requests,
+		COALESCE(AVG(duration_ms), 0)         AS avg_latency,
+		COALESCE(SUM(input_tokens), 0)        AS input_tokens,
+		COALESCE(SUM(output_tokens), 0)       AS output_tokens,
+		COALESCE(SUM(reasoning_tokens), 0)    AS reasoning_tokens,
+		COALESCE(SUM(cached_tokens), 0)       AS cached_tokens
+	FROM usage_logs
+	WHERE created_at >= $1 AND created_at <= $2
+	GROUP BY 1
+	ORDER BY 1`
+
+	rows, err := db.conn.QueryContext(ctx, timelineQuery, start, end, bucketMinutes)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var p ChartTimelinePoint
+		if err := rows.Scan(&p.Bucket, &p.Requests, &p.AvgLatency, &p.InputTokens, &p.OutputTokens, &p.ReasoningTokens, &p.CachedTokens); err != nil {
+			return nil, err
+		}
+		result.Timeline = append(result.Timeline, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if result.Timeline == nil {
+		result.Timeline = []ChartTimelinePoint{}
+	}
+
+	// 模型排行聚合：Top 10
+	modelQuery := `
+	SELECT COALESCE(model, 'unknown'), COUNT(*) AS requests
+	FROM usage_logs
+	WHERE created_at >= $1 AND created_at <= $2
+	GROUP BY 1
+	ORDER BY 2 DESC
+	LIMIT 10`
+
+	mRows, err := db.conn.QueryContext(ctx, modelQuery, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer mRows.Close()
+
+	for mRows.Next() {
+		var m ChartModelPoint
+		if err := mRows.Scan(&m.Model, &m.Requests); err != nil {
+			return nil, err
+		}
+		result.Models = append(result.Models, m)
+	}
+	if result.Models == nil {
+		result.Models = []ChartModelPoint{}
+	}
+
+	return result, mRows.Err()
+}
+
 // ListUsageLogsByTimeRange 按时间范围查询请求日志
 func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time) ([]*UsageLog, error) {
 	query := `SELECT u.id, u.account_id, u.endpoint, u.model, u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,

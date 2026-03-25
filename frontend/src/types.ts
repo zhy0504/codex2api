@@ -184,6 +184,26 @@ export interface UsageLogsPagedResponse {
   total: number
 }
 
+export interface ChartTimelinePoint {
+  bucket: string
+  requests: number
+  avg_latency: number
+  input_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  cached_tokens: number
+}
+
+export interface ChartModelPoint {
+  model: string
+  requests: number
+}
+
+export interface ChartAggregation {
+  timeline: ChartTimelinePoint[]
+  models: ChartModelPoint[]
+}
+
 export interface APIKeyRow {
   id: number
   name: string

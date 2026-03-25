@@ -2,12 +2,12 @@ import type { ReactNode } from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
-import DashboardUsageCharts, { getTimeRangeISO } from '../components/DashboardUsageCharts'
+import DashboardUsageCharts, { getTimeRangeISO, getBucketConfig } from '../components/DashboardUsageCharts'
 import type { TimeRangeKey } from '../components/DashboardUsageCharts'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import StatCard from '../components/StatCard'
-import type { StatsResponse, UsageLog, UsageStats } from '../types'
+import type { StatsResponse, UsageStats, ChartAggregation } from '../types'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { Card, CardContent } from '@/components/ui/card'
 import { Users, CheckCircle, XCircle, Activity, Zap, Clock, AlertTriangle, BarChart3, Database } from 'lucide-react'
@@ -17,9 +17,10 @@ const DASHBOARD_REFRESH_INTERVAL_MS = 15_000
 export default function Dashboard() {
   const { t } = useTranslation()
   const [timeRange, setTimeRange] = useState<TimeRangeKey>('1h')
-  const [logs, setLogs] = useState<UsageLog[]>([])
-  const [logsRefreshedAt, setLogsRefreshedAt] = useState<number | null>(null)
-  const logsAbort = useRef<AbortController | null>(null)
+  const [chartData, setChartData] = useState<ChartAggregation | null>(null)
+  const [chartRefreshedAt, setChartRefreshedAt] = useState<number | null>(null)
+  const [chartLoading, setChartLoading] = useState(true)
+  const chartAbort = useRef<AbortController | null>(null)
 
   // 仅加载轻量级统计数据（秒级响应）
   const loadDashboardStats = useCallback(async () => {
@@ -38,27 +39,33 @@ export default function Dashboard() {
     load: loadDashboardStats,
   })
 
-  // 日志独立异步加载（不阻塞统计卡片渲染）
-  const loadLogs = useCallback(async () => {
-    logsAbort.current?.abort()
+  // 加载服务端聚合的图表数据（12~48 个聚合点，非原始行）
+  const loadChartData = useCallback(async () => {
+    chartAbort.current?.abort()
     const controller = new AbortController()
-    logsAbort.current = controller
+    chartAbort.current = controller
+    setChartLoading(true)
     try {
       const { start, end } = getTimeRangeISO(timeRange)
-      const res = await api.getUsageLogs({ start, end })
+      const { bucketMinutes } = getBucketConfig(timeRange)
+      const res = await api.getChartData({ start, end, bucketMinutes })
       if (!controller.signal.aborted) {
-        setLogs(res.logs ?? [])
-        setLogsRefreshedAt(Date.now())
+        setChartData(res)
+        setChartRefreshedAt(Date.now())
       }
     } catch {
-      // 静默容错，图表区域保持上次数据
+      // 静默容错
+    } finally {
+      if (!controller.signal.aborted) {
+        setChartLoading(false)
+      }
     }
   }, [timeRange])
 
-  // 首次加载 + timeRange 变更时重新拉取日志
+  // 首次加载 + timeRange 变更时重新拉取图表数据
   useEffect(() => {
-    void loadLogs()
-  }, [loadLogs])
+    void loadChartData()
+  }, [loadChartData])
 
   // 仅在 1h（实时）模式下启用自动刷新
   useEffect(() => {
@@ -67,11 +74,11 @@ export default function Dashboard() {
     const timer = window.setInterval(() => {
       if (document.visibilityState !== 'visible') return
       void reloadSilently()
-      void loadLogs()
+      void loadChartData()
     }, DASHBOARD_REFRESH_INTERVAL_MS)
 
     return () => window.clearInterval(timer)
-  }, [reloadSilently, timeRange, loadLogs])
+  }, [reloadSilently, timeRange, loadChartData])
 
   const { stats, usageStats } = data
   const total = stats?.total ?? 0
@@ -91,7 +98,7 @@ export default function Dashboard() {
       variant="page"
       loading={loading}
       error={error}
-      onRetry={() => { void reload(); void loadLogs() }}
+      onRetry={() => { void reload(); void loadChartData() }}
       loadingTitle={t('dashboard.loadingTitle')}
       loadingDescription={t('dashboard.loadingDesc')}
       errorTitle={t('dashboard.errorTitle')}
@@ -100,7 +107,7 @@ export default function Dashboard() {
         <PageHeader
           title={t('dashboard.title')}
           description={t('dashboard.description')}
-          onRefresh={() => { void reload(); void loadLogs() }}
+          onRefresh={() => { void reload(); void loadChartData() }}
         />
 
         {/* Account status */}
@@ -140,11 +147,12 @@ export default function Dashboard() {
               </CardContent>
             </Card>
             <DashboardUsageCharts
-              logs={logs}
-              refreshedAt={logsRefreshedAt}
+              chartData={chartData}
+              refreshedAt={chartRefreshedAt}
               refreshIntervalMs={DASHBOARD_REFRESH_INTERVAL_MS}
               timeRange={timeRange}
               onTimeRangeChange={setTimeRange}
+              loading={chartLoading}
             />
           </div>
         )}

@@ -17,16 +17,17 @@ import {
 } from 'recharts'
 import { Card, CardContent } from '@/components/ui/card'
 import StateShell from './StateShell'
-import type { UsageLog } from '../types'
+import type { ChartAggregation } from '../types'
 
 export type TimeRangeKey = '1h' | '6h' | '24h' | '7d' | '30d'
 
 interface DashboardUsageChartsProps {
-  logs: UsageLog[]
+  chartData: ChartAggregation | null
   refreshedAt: number | null
   refreshIntervalMs: number
   timeRange: TimeRangeKey
   onTimeRangeChange: (range: TimeRangeKey) => void
+  loading?: boolean
 }
 
 interface TimelinePoint {
@@ -44,7 +45,6 @@ interface ModelRankingPoint {
   model: string
   shortModel: string
   requests: number
-  totalTokens: number
 }
 
 const chartMargin = { top: 8, right: 12, left: -12, bottom: 0 }
@@ -66,7 +66,7 @@ const compactNumberFormatter = new Intl.NumberFormat(undefined, {
 const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
 
 /** 根据时间跨度计算桶大小（分钟）和桶数量 */
-function getBucketConfig(range: TimeRangeKey): { bucketMinutes: number; bucketCount: number } {
+export function getBucketConfig(range: TimeRangeKey): { bucketMinutes: number; bucketCount: number } {
   switch (range) {
     case '1h':
       return { bucketMinutes: 5, bucketCount: 12 }
@@ -84,122 +84,57 @@ function getBucketConfig(range: TimeRangeKey): { bucketMinutes: number; bucketCo
 }
 
 export default function DashboardUsageCharts({
-  logs,
+  chartData: serverData,
   refreshedAt,
   refreshIntervalMs,
   timeRange,
   onTimeRangeChange,
+  loading = false,
 }: DashboardUsageChartsProps) {
   const { t } = useTranslation()
   const { bucketMinutes, bucketCount } = getBucketConfig(timeRange)
   const isLive = timeRange === '1h'
   const lastUpdatedAtLabel = formatClockTime(refreshedAt)
+  const useFullDate = bucketMinutes >= 360
 
-  const chartData = useMemo(() => {
-    const parsedLogs = logs
-      .map((log) => {
-        const createdAt = parseUsageDate(log.created_at)
-        if (!createdAt) return null
-        return { ...log, createdAt }
-      })
-      .filter((log): log is UsageLog & { createdAt: Date } => Boolean(log))
-      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+  // 将服务端聚合数据映射为图表渲染格式（极轻量，无聚合计算）
+  const displayData = useMemo(() => {
+    if (!serverData) return { timelineData: [] as TimelinePoint[], modelData: [] as ModelRankingPoint[], sampleCount: 0 }
 
-    if (parsedLogs.length === 0) {
+    const totalRequests = serverData.timeline.reduce((sum, p) => sum + p.requests, 0)
+
+    const timelineData: TimelinePoint[] = serverData.timeline.map((point) => {
+      const d = new Date(point.bucket)
       return {
-        timelineData: [] as TimelinePoint[],
-        modelData: [] as ModelRankingPoint[],
-        sampleCount: 0,
-      }
-    }
-
-    const referenceDate = refreshedAt ? new Date(refreshedAt) : parsedLogs[parsedLogs.length - 1].createdAt
-    const latestBucketEnd = ceilDateToBucket(referenceDate, bucketMinutes)
-
-    const bucketMs = bucketMinutes * 60 * 1000
-    const windowStart = latestBucketEnd.getTime() - bucketCount * bucketMs
-
-    const useFullDate = bucketMinutes >= 360
-
-    const timelineData: TimelinePoint[] = Array.from({ length: bucketCount }, (_, index) => {
-      const bucketDate = new Date(windowStart + index * bucketMs)
-      return {
-        label: useFullDate ? formatDateLabel(bucketDate, bucketMinutes) : formatMinuteLabel(bucketDate),
-        fullLabel: formatFullLabel(bucketDate, bucketMinutes),
-        requests: 0,
-        avgLatency: null,
-        inputTokens: 0,
-        outputTokens: 0,
-        reasoningTokens: 0,
-        cachedTokens: 0,
+        label: useFullDate ? formatDateLabel(d, bucketMinutes) : formatMinuteLabel(d),
+        fullLabel: formatFullLabel(d, bucketMinutes),
+        requests: point.requests,
+        avgLatency: point.avg_latency > 0 ? Math.round(point.avg_latency) : null,
+        inputTokens: point.input_tokens,
+        outputTokens: point.output_tokens,
+        reasoningTokens: point.reasoning_tokens,
+        cachedTokens: point.cached_tokens,
       }
     })
 
-    const latencyTotals = Array.from({ length: bucketCount }, () => 0)
-    const latencySamples = Array.from({ length: bucketCount }, () => 0)
-    const windowLogs: Array<UsageLog & { createdAt: Date }> = []
-
-    for (const log of parsedLogs) {
-      const timestamp = log.createdAt.getTime()
-      if (timestamp < windowStart || timestamp >= latestBucketEnd.getTime()) continue
-
-      const bucketIndex = Math.min(bucketCount - 1, Math.floor((timestamp - windowStart) / bucketMs))
-      const bucket = timelineData[bucketIndex]
-
-      bucket.requests += 1
-      bucket.inputTokens += Math.max(log.input_tokens, 0)
-      bucket.outputTokens += Math.max(log.output_tokens, 0)
-      bucket.reasoningTokens += Math.max(log.reasoning_tokens, 0)
-      bucket.cachedTokens += Math.max(log.cached_tokens, 0)
-
-      if (log.duration_ms > 0) {
-        latencyTotals[bucketIndex] += log.duration_ms
-        latencySamples[bucketIndex] += 1
-      }
-
-      windowLogs.push(log)
-    }
-
-    for (let index = 0; index < bucketCount; index += 1) {
-      if (latencySamples[index] > 0) {
-        timelineData[index].avgLatency = Math.round(latencyTotals[index] / latencySamples[index])
-      }
-    }
-
-    const modelRankingMap = new Map<string, { requests: number; totalTokens: number }>()
-
-    for (const log of windowLogs) {
-      const model = log.model.trim() || t('dashboard.unknownModel')
-      const current = modelRankingMap.get(model) ?? { requests: 0, totalTokens: 0 }
-      current.requests += 1
-      current.totalTokens += Math.max(log.total_tokens, 0)
-      modelRankingMap.set(model, current)
-    }
-
-    const modelData = Array.from(modelRankingMap.entries())
-      .map(([model, value]) => ({
-        model,
-        shortModel: truncateLabel(model, 22),
-        requests: value.requests,
-        totalTokens: value.totalTokens,
-      }))
-      .sort((left, right) => right.requests - left.requests || right.totalTokens - left.totalTokens)
+    const modelData: ModelRankingPoint[] = serverData.models
       .slice(0, 5)
       .reverse()
+      .map((m) => ({
+        model: m.model,
+        shortModel: truncateLabel(m.model, 22),
+        requests: m.requests,
+      }))
 
-    return {
-      timelineData,
-      modelData,
-      sampleCount: windowLogs.length,
-    }
-  }, [logs, refreshedAt, t, bucketMinutes, bucketCount])
+    return { timelineData, modelData, sampleCount: totalRequests }
+  }, [serverData, useFullDate, bucketMinutes])
 
   return (
     <div className="space-y-4">
       <div className="flex items-start justify-between gap-4 flex-wrap">
         <div>
           <h3 className="text-base font-semibold text-foreground">{t('dashboard.usageCharts')}</h3>
-          <p className="mt-1 text-sm text-muted-foreground">{t('dashboard.usageChartsDesc', { count: chartData.sampleCount.toLocaleString() })}</p>
+          <p className="mt-1 text-sm text-muted-foreground">{t('dashboard.usageChartsDesc', { count: displayData.sampleCount.toLocaleString() })}</p>
           {isLive && (
             <p className="mt-1 text-xs text-muted-foreground">
               {t('dashboard.liveWindowDesc', {
@@ -237,7 +172,29 @@ export default function DashboardUsageCharts({
         </div>
       </div>
 
-      {chartData.sampleCount === 0 ? (
+      {loading ? (
+        <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+          {[0, 1, 2, 3].map((i) => (
+            <Card key={i} className="py-0">
+              <CardContent className="p-6">
+                <div className="mb-5 space-y-2">
+                  <div className="h-4 w-32 rounded-md bg-muted animate-pulse" />
+                  <div className="h-3 w-48 rounded-md bg-muted/60 animate-pulse" />
+                </div>
+                <div className="h-[280px] flex items-end gap-2 px-4 pb-4">
+                  {[40, 65, 30, 80, 55, 70, 45, 60, 35, 75, 50, 68].map((h, j) => (
+                    <div
+                      key={j}
+                      className="flex-1 rounded-t-md bg-muted/50 animate-pulse"
+                      style={{ height: `${h}%`, animationDelay: `${j * 80}ms` }}
+                    />
+                  ))}
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      ) : displayData.sampleCount === 0 ? (
         <Card>
           <CardContent className="p-6">
             <StateShell
@@ -254,7 +211,7 @@ export default function DashboardUsageCharts({
         <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
           <ChartCard title={t('dashboard.requestTrend')} description={t('dashboard.requestTrendDesc')}>
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData.timelineData} margin={chartMargin}>
+              <AreaChart data={displayData.timelineData} margin={chartMargin}>
                 <defs>
                   <linearGradient id="dashboard-request-gradient" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="5%" stopColor="hsl(var(--primary))" stopOpacity={0.28} />
@@ -286,7 +243,7 @@ export default function DashboardUsageCharts({
 
           <ChartCard title={t('dashboard.latencyTrend')} description={t('dashboard.latencyTrendDesc')}>
             <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={chartData.timelineData} margin={chartMargin}>
+              <LineChart data={displayData.timelineData} margin={chartMargin}>
                 <CartesianGrid vertical={false} stroke={gridColor} strokeDasharray="4 4" />
                 <XAxis dataKey="label" tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} minTickGap={20} tickMargin={8} />
                 <YAxis tickFormatter={formatDurationTick} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} width={54} />
@@ -314,7 +271,7 @@ export default function DashboardUsageCharts({
 
           <ChartCard title={t('dashboard.tokenBreakdown')} description={t('dashboard.tokenBreakdownDesc')}>
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData.timelineData} margin={chartMargin}>
+              <BarChart data={displayData.timelineData} margin={chartMargin}>
                 <CartesianGrid vertical={false} stroke={gridColor} strokeDasharray="4 4" />
                 <XAxis dataKey="label" tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} minTickGap={20} tickMargin={8} />
                 <YAxis tickFormatter={formatCompactNumber} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} />
@@ -337,7 +294,7 @@ export default function DashboardUsageCharts({
 
           <ChartCard title={t('dashboard.modelRanking')} description={t('dashboard.modelRankingDesc')}>
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={chartData.modelData} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 0 }}>
+              <BarChart data={displayData.modelData} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 0 }}>
                 <CartesianGrid horizontal={false} stroke={gridColor} strokeDasharray="4 4" />
                 <XAxis type="number" tickFormatter={formatCompactNumber} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} allowDecimals={false} />
                 <YAxis dataKey="shortModel" type="category" width={128} tick={{ fill: axisColor, fontSize: 12 }} axisLine={{ stroke: gridColor }} tickLine={{ stroke: gridColor }} />
@@ -371,18 +328,6 @@ function ChartCard({ title, description, children }: { title: string; descriptio
       </CardContent>
     </Card>
   )
-}
-
-function parseUsageDate(value: string): Date | null {
-  const normalizedValue = value.replace(/(Z|[+-]\d{2}(:\d{2})?)$/, '')
-  const parsed = new Date(normalizedValue)
-  if (Number.isNaN(parsed.getTime())) return null
-  return parsed
-}
-
-function ceilDateToBucket(date: Date, bucketMinutes: number): Date {
-  const bucketMs = bucketMinutes * 60 * 1000
-  return new Date(Math.ceil(date.getTime() / bucketMs) * bucketMs)
 }
 
 function formatMinuteLabel(date: Date): string {
@@ -499,4 +444,3 @@ export function getTimeRangeISO(range: TimeRangeKey): { start: string; end: stri
   const start = toLocalRFC3339(new Date(now.getTime() - offsetMs))
   return { start, end }
 }
-

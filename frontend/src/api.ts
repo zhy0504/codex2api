@@ -3,6 +3,7 @@ import type {
   AdminErrorResponse,
   APIKeysResponse,
   AccountsResponse,
+  ChartAggregation,
   CreateAccountResponse,
   CreateAPIKeyResponse,
   HealthResponse,
@@ -99,6 +100,13 @@ export const api = {
     searchParams.set('page', String(params.page))
     if (params.pageSize) searchParams.set('page_size', String(params.pageSize))
     return request<UsageLogsPagedResponse>(`/usage/logs?${searchParams.toString()}`)
+  },
+  getChartData: (params: { start: string; end: string; bucketMinutes: number }) => {
+    const searchParams = new URLSearchParams()
+    searchParams.set('start', params.start)
+    searchParams.set('end', params.end)
+    searchParams.set('bucket_minutes', String(params.bucketMinutes))
+    return request<ChartAggregation>(`/usage/chart-data?${searchParams.toString()}`)
   },
   getAPIKeys: () => request<APIKeysResponse>('/keys'),
   createAPIKey: (name: string, key?: string) =>
