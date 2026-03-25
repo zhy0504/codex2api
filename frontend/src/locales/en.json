@@ -148,6 +148,7 @@
     "requests": "Requests",
     "usage": "Usage",
     "updatedAt": "Updated",
+    "importTime": "Import Time",
     "actions": "Actions",
     "test": "Test",
     "refreshToken": "Refresh",

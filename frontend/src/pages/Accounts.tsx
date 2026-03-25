@@ -12,7 +12,7 @@ import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import type { AccountRow, AddAccountRequest } from '../types'
 import { getErrorMessage } from '../utils/error'
-import { formatRelativeTime } from '../utils/time'
+import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -32,7 +32,7 @@ export default function Accounts() {
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned'>('all')
-  const [sortKey, setSortKey] = useState<'requests' | 'usage' | null>(null)
+  const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
 
   const PAGE_SIZE = 20
@@ -108,6 +108,8 @@ export default function Accounts() {
       diff = ((a.success_requests ?? 0) + (a.error_requests ?? 0)) - ((b.success_requests ?? 0) + (b.error_requests ?? 0))
     } else if (sortKey === 'usage') {
       diff = (a.usage_percent_7d ?? -1) - (b.usage_percent_7d ?? -1)
+    } else if (sortKey === 'importTime') {
+      diff = new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime()
     }
     return sortDir === 'asc' ? diff : -diff
   })
@@ -456,6 +458,12 @@ export default function Accounts() {
                       >
                         {t('accounts.usage')} {sortKey === 'usage' ? (sortDir === 'desc' ? '↓' : '↑') : ''}
                       </TableHead>
+                      <TableHead
+                        className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
+                        onClick={() => { if (sortKey === 'importTime') { setSortDir(d => d === 'asc' ? 'desc' : 'asc') } else { setSortKey('importTime'); setSortDir('desc') }; setPage(1) }}
+                      >
+                        {t('accounts.importTime')} {sortKey === 'importTime' ? (sortDir === 'desc' ? '↓' : '↑') : ''}
+                      </TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('accounts.updatedAt')}</TableHead>
                       <TableHead className="text-[13px] font-semibold text-right">{t('accounts.actions')}</TableHead>
                     </TableRow>
@@ -523,6 +531,7 @@ export default function Accounts() {
                             <span className="text-[13px] text-muted-foreground">-</span>
                           )}
                         </TableCell>
+                        <TableCell className="text-[13px] text-muted-foreground whitespace-nowrap">{formatBeijingTime(account.created_at)}</TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">{formatRelativeTime(account.updated_at)}</TableCell>
                         <TableCell className="text-right">
                           <div className="flex items-center gap-1.5 justify-end">

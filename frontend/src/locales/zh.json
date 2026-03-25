@@ -148,6 +148,7 @@
     "requests": "请求统计",
     "usage": "用量",
     "updatedAt": "更新时间",
+    "importTime": "导入时间",
     "actions": "操作",
     "test": "测试",
     "refreshToken": "刷新",

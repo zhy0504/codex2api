@@ -325,6 +325,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		var firstTokenMs int
 		var usage *UsageInfo
 		ttftRecorded := false
+		gotCompleted := false  // 是否收到 response.completed
+		deltaCharCount := 0    // 累计 delta 字符数（用于断流时估算 token）
 
 		if isStream {
 			// 流式透传 + TTFT 跟踪
@@ -352,9 +354,15 @@ func (h *Handler) Responses(c *gin.Context) {
 					ttftRecorded = true
 				}
 
+				// 累计 delta 字符数
+				if eventType == "response.output_text.delta" {
+					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
+				}
+
 				// 提取 usage
 				if eventType == "response.completed" {
 					usage = extractUsage(data)
+					gotCompleted = true
 				}
 
 				fmt.Fprintf(c.Writer, "data: %s\n\n", data)
@@ -370,8 +378,13 @@ func (h *Handler) Responses(c *gin.Context) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
+				// 累计 delta 字符数
+				if eventType == "response.output_text.delta" {
+					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
+				}
 				if eventType == "response.completed" {
 					usage = extractUsage(data)
+					gotCompleted = true
 					lastResponseData = data
 					return false
 				}
@@ -398,13 +411,30 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 		}
 
-		// 记录完整 usage
+		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
+		logStatusCode := 200
+		if !gotCompleted && usage == nil {
+			logStatusCode = 499 // 标记为异常断流
+			log.Printf("流提前断开 (account %d, /v1/responses): 未收到 response.completed, 已转发约 %d 字符", account.ID(), deltaCharCount)
+			if deltaCharCount > 0 {
+				estOutputTokens := deltaCharCount / 3 // 粗略估算: 约 3 字符 = 1 token
+				if estOutputTokens < 1 {
+					estOutputTokens = 1
+				}
+				usage = &UsageInfo{
+					OutputTokens:     estOutputTokens,
+					CompletionTokens: estOutputTokens,
+					TotalTokens:      estOutputTokens,
+				}
+			}
+		}
+
 		logInput := &database.UsageLogInput{
 			AccountID:        account.ID(),
 			Endpoint:         "/v1/responses",
 			Model:            model,
-			StatusCode:       200,
+			StatusCode:       logStatusCode,
 			DurationMs:       totalDuration,
 			FirstTokenMs:     firstTokenMs,
 			ReasoningEffort:  reasoningEffort,
@@ -541,6 +571,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var firstTokenMs int
 		var usage *UsageInfo
 		ttftRecorded := false
+		gotCompleted := false  // 是否收到 response.completed
+		deltaCharCount := 0    // 累计 delta 字符数（用于断流时估算 token）
 
 		chunkID := "chatcmpl-" + uuid.New().String()[:8]
 		created := time.Now().Unix()
@@ -569,8 +601,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
+				// 累计 delta 字符数
+				if eventType == "response.output_text.delta" {
+					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
+				}
 				if eventType == "response.completed" {
 					usage = extractUsage(data)
+					gotCompleted = true
 				}
 
 				if chunk != nil {
@@ -596,9 +633,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 				switch eventType {
 				case "response.output_text.delta":
+					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
 					fullContent.WriteString(gjson.GetBytes(data, "delta").String())
 				case "response.completed":
 					usage = extractUsage(data)
+					gotCompleted = true
 					return false
 				case "response.failed":
 					return false
@@ -625,13 +664,30 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			c.Data(http.StatusOK, "application/json", result)
 		}
 
-		// 记录完整 usage
+		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
+		logStatusCode := 200
+		if !gotCompleted && usage == nil {
+			logStatusCode = 499 // 标记为异常断流
+			log.Printf("流提前断开 (account %d, /v1/chat/completions): 未收到 response.completed, 已转发约 %d 字符", account.ID(), deltaCharCount)
+			if deltaCharCount > 0 {
+				estOutputTokens := deltaCharCount / 3
+				if estOutputTokens < 1 {
+					estOutputTokens = 1
+				}
+				usage = &UsageInfo{
+					OutputTokens:     estOutputTokens,
+					CompletionTokens: estOutputTokens,
+					TotalTokens:      estOutputTokens,
+				}
+			}
+		}
+
 		logInput := &database.UsageLogInput{
 			AccountID:        account.ID(),
 			Endpoint:         "/v1/chat/completions",
 			Model:            model,
-			StatusCode:       200,
+			StatusCode:       logStatusCode,
 			DurationMs:       totalDuration,
 			FirstTokenMs:     firstTokenMs,
 			ReasoningEffort:  reasoningEffort,

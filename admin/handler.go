@@ -169,6 +169,7 @@ type accountResponse struct {
 	SchedulerScore     float64                    `json:"scheduler_score"`
 	ConcurrencyCap     int64                      `json:"dynamic_concurrency_limit"`
 	ProxyURL           string                     `json:"proxy_url"`
+	CreatedAt          string                     `json:"created_at"`
 	UpdatedAt          string                     `json:"updated_at"`
 	ActiveRequests     int64                      `json:"active_requests"`
 	TotalRequests      int64                      `json:"total_requests"`
@@ -227,6 +228,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			PlanType:  row.GetCredential("plan_type"),
 			Status:    row.Status,
 			ProxyURL:  row.ProxyURL,
+			CreatedAt: row.CreatedAt.Format(time.RFC3339),
 			UpdatedAt: row.UpdatedAt.Format(time.RFC3339),
 		}
 		if acc, ok := accountMap[row.ID]; ok {
