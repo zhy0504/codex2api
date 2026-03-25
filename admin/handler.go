@@ -1164,8 +1164,9 @@ func (h *Handler) BatchDeleteProxies(c *gin.Context) {
 // TestProxy 测试代理连通性与出口 IP 位置
 func (h *Handler) TestProxy(c *gin.Context) {
 	var req struct {
-		URL string `json:"url"`
-		ID  int64  `json:"id"`
+		URL  string `json:"url"`
+		ID   int64  `json:"id"`
+		Lang string `json:"lang"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.URL == "" {
 		writeError(c, http.StatusBadRequest, "请提供代理 URL")
@@ -1182,8 +1183,12 @@ func (h *Handler) TestProxy(c *gin.Context) {
 	transport.Proxy = http.ProxyURL(proxyURL)
 	client := &http.Client{Transport: transport, Timeout: 15 * time.Second}
 
+	apiLang := req.Lang
+	if apiLang == "" {
+		apiLang = "en"
+	}
 	start := time.Now()
-	resp, err := client.Get("http://ip-api.com/json/?lang=zh-CN&fields=status,message,country,regionName,city,isp,query")
+	resp, err := client.Get(fmt.Sprintf("http://ip-api.com/json/?lang=%s&fields=status,message,country,regionName,city,isp,query", apiLang))
 	latencyMs := int(time.Since(start).Milliseconds())
 
 	if err != nil {

@@ -341,7 +341,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		start := time.Now()
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID)
+		proxyURL := h.store.NextProxy()
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -392,8 +393,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 成功！透传响应并跟踪 TTFT / usage
 		account.Mu().RLock()
 		c.Set("x-account-email", account.Email)
-		c.Set("x-account-proxy", account.ProxyURL)
 		account.Mu().RUnlock()
+		c.Set("x-account-proxy", proxyURL)
 		var firstTokenMs int
 		var usage *UsageInfo
 		ttftRecorded := false
@@ -624,7 +625,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		start := time.Now()
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID)
+		proxyURL := h.store.NextProxy()
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -675,8 +677,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 成功！翻译响应 + TTFT 跟踪
 		account.Mu().RLock()
 		c.Set("x-account-email", account.Email)
-		c.Set("x-account-proxy", account.ProxyURL)
 		account.Mu().RUnlock()
+		c.Set("x-account-proxy", proxyURL)
 		var firstTokenMs int
 		var usage *UsageInfo
 		ttftRecorded := false

@@ -114,7 +114,7 @@ const (
 
 // ExecuteRequest 向 Codex 上游发送请求
 // sessionID 可选，用于 prompt cache 会话绑定
-func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string) (*http.Response, error) {
+func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string) (*http.Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -124,6 +124,11 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	accountID := account.AccountID
 	proxyURL := account.ProxyURL
 	account.Mu().RUnlock()
+
+	// 代理池优先级: proxyOverride (来自 NextProxy) > account.ProxyURL
+	if proxyOverride != "" {
+		proxyURL = proxyOverride
+	}
 
 	if accessToken == "" {
 		return nil, fmt.Errorf("无可用 access_token")

@@ -32,7 +32,7 @@ function maskUrl(url: string): string {
 }
 
 export default function Proxies() {
-  const { t } = useTranslation()
+  const { t, i18n } = useTranslation()
   const [proxies, setProxies] = useState<ProxyRow[]>([])
   const [loading, setLoading] = useState(true)
   const [poolEnabled, setPoolEnabled] = useState(false)
@@ -45,6 +45,8 @@ export default function Proxies() {
   const [testAllLoading, setTestAllLoading] = useState(false)
   const [page, setPage] = useState(1)
   const [revealedIds, setRevealedIds] = useState<Set<number>>(new Set())
+
+  const ipApiLang = i18n.language?.startsWith('zh') ? 'zh-CN' : 'en'
 
   const reload = useCallback(async () => {
     try {
@@ -114,7 +116,7 @@ export default function Proxies() {
   const handleTest = async (p: ProxyRow) => {
     setTestingIds(prev => new Set(prev).add(p.id))
     try {
-      const result = await api.testProxy(p.url, p.id)
+      const result = await api.testProxy(p.url, p.id, ipApiLang)
       if (result.success) {
         setProxies(prev => prev.map(px =>
           px.id === p.id
@@ -135,7 +137,7 @@ export default function Proxies() {
     for (const p of proxies) {
       setTestingIds(prev => new Set(prev).add(p.id))
       try {
-        const result = await api.testProxy(p.url, p.id)
+        const result = await api.testProxy(p.url, p.id, ipApiLang)
         if (result.success) {
           setProxies(prev => prev.map(px =>
             px.id === p.id
