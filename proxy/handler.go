@@ -407,9 +407,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		c.Set("x-account-proxy", proxyURL)
 		c.Set("x-model", model)
 		c.Set("x-reasoning-effort", reasoningEffort)
-		c.Set("x-service-tier", serviceTier)
 		var firstTokenMs int
 		var usage *UsageInfo
+		var actualServiceTier string
 		ttftRecorded := false
 		gotTerminal := false // 是否收到 response.completed 或 response.failed
 		deltaCharCount := 0  // 累计 delta 字符数（用于断流时估算 token）
@@ -449,9 +449,12 @@ func (h *Handler) Responses(c *gin.Context) {
 					deltaCharCount += len(gjson.GetBytes(data, "delta").String())
 				}
 
-				// 提取 usage
+				// 提取 usage + service_tier
 				if eventType == "response.completed" {
 					usage = extractUsage(data)
+					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
+						actualServiceTier = tier
+					}
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -481,6 +484,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				if eventType == "response.completed" {
 					usage = extractUsage(data)
+					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
+						actualServiceTier = tier
+					}
 					gotTerminal = true
 					lastResponseData = data
 					return false
@@ -544,6 +550,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 		}
 
+		c.Set("x-service-tier", actualServiceTier)
+
 		logInput := &database.UsageLogInput{
 			AccountID:        account.ID(),
 			Endpoint:         "/v1/responses",
@@ -555,7 +563,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			InboundEndpoint:  "/v1/responses",
 			UpstreamEndpoint: "/v1/responses",
 			Stream:           isStream,
-			ServiceTier:      serviceTier,
+			ServiceTier:      actualServiceTier,
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
@@ -697,9 +705,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		c.Set("x-account-proxy", proxyURL)
 		c.Set("x-model", model)
 		c.Set("x-reasoning-effort", reasoningEffort)
-		c.Set("x-service-tier", serviceTier)
 		var firstTokenMs int
 		var usage *UsageInfo
+		var actualServiceTier string
 		ttftRecorded := false
 		gotTerminal := false // 是否收到 response.completed 或 response.failed
 		deltaCharCount := 0  // 累计 delta 字符数（用于断流时估算 token）
@@ -741,6 +749,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 				if eventType == "response.completed" {
 					usage = extractUsage(data)
+					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
+						actualServiceTier = tier
+					}
 					gotTerminal = true
 				}
 				if eventType == "response.failed" {
@@ -782,6 +793,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					fullContent.WriteString(gjson.GetBytes(data, "delta").String())
 				case "response.completed":
 					usage = extractUsage(data)
+					if tier := gjson.GetBytes(data, "response.service_tier").String(); tier != "" {
+						actualServiceTier = tier
+					}
 					gotTerminal = true
 					return false
 				case "response.failed":
@@ -853,6 +867,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 		}
 
+		c.Set("x-service-tier", actualServiceTier)
+
 		logInput := &database.UsageLogInput{
 			AccountID:        account.ID(),
 			Endpoint:         "/v1/chat/completions",
@@ -864,7 +880,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			InboundEndpoint:  "/v1/chat/completions",
 			UpstreamEndpoint: "/v1/responses",
 			Stream:           isStream,
-			ServiceTier:      serviceTier,
+			ServiceTier:      actualServiceTier,
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens

@@ -236,7 +236,7 @@ func loggerMiddleware() gin.HandlerFunc {
 		if e, ok := effortVal.(string); ok && e != "" {
 			tags = append(tags, "effort="+e)
 		}
-		if t, ok := tierVal.(string); ok && t != "" {
+		if t, ok := tierVal.(string); ok && t == "fast" {
 			tags = append(tags, "fast")
 		}
 		tagStr := ""
