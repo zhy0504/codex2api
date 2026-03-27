@@ -32,9 +32,11 @@ type createAccountResponse struct {
 }
 
 type healthResponse struct {
-	Status    string `json:"status"`
-	Available int    `json:"available"`
-	Total     int    `json:"total"`
+	Status          string `json:"status"`
+	Available       int    `json:"available"`
+	Total           int    `json:"total"`
+	PostgresHealthy bool   `json:"postgres_healthy"`
+	RedisHealthy    bool   `json:"redis_healthy"`
 }
 
 type usageLogsResponse struct {

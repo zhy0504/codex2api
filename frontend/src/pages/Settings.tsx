@@ -252,18 +252,18 @@ export default function Settings() {
               <div className="flex flex-col gap-1.5 p-3.5 rounded-2xl bg-white/40 border border-border">
                 <label className="text-xs font-bold text-muted-foreground">PostgreSQL</label>
                 <div className="text-[15px] font-semibold">
-                  <Badge variant="default" className="gap-1.5">
-                    <span className="size-1.5 rounded-full bg-emerald-500" />
-                    {t('common.connected')}
+                  <Badge variant={health?.postgres_healthy ? 'default' : 'destructive'} className="gap-1.5">
+                    <span className={`size-1.5 rounded-full ${health?.postgres_healthy ? 'bg-emerald-500' : 'bg-red-400'}`} />
+                    {health?.postgres_healthy ? t('common.connected') : t('common.error')}
                   </Badge>
                 </div>
               </div>
               <div className="flex flex-col gap-1.5 p-3.5 rounded-2xl bg-white/40 border border-border">
                 <label className="text-xs font-bold text-muted-foreground">Redis</label>
                 <div className="text-[15px] font-semibold">
-                  <Badge variant="default" className="gap-1.5">
-                    <span className="size-1.5 rounded-full bg-emerald-500" />
-                    {t('common.connected')}
+                  <Badge variant={health?.redis_healthy ? 'default' : 'destructive'} className="gap-1.5">
+                    <span className={`size-1.5 rounded-full ${health?.redis_healthy ? 'bg-emerald-500' : 'bg-red-400'}`} />
+                    {health?.redis_healthy ? t('common.connected') : t('common.error')}
                   </Badge>
                 </div>
               </div>

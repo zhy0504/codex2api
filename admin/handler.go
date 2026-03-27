@@ -920,10 +920,30 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 
 // GetHealth 系统健康检查（扩展版）
 func (h *Handler) GetHealth(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+
+	pgHealthy := false
+	if h.db != nil && h.db.Ping(ctx) == nil {
+		pgHealthy = true
+	}
+
+	redisHealthy := false
+	if h.cache != nil && h.cache.Ping(ctx) == nil {
+		redisHealthy = true
+	}
+
+	status := "ok"
+	if !pgHealthy || !redisHealthy {
+		status = "degraded"
+	}
+
 	c.JSON(http.StatusOK, healthResponse{
-		Status:    "ok",
-		Available: h.store.AvailableCount(),
-		Total:     h.store.AccountCount(),
+		Status:          status,
+		Available:       h.store.AvailableCount(),
+		Total:           h.store.AccountCount(),
+		PostgresHealthy: pgHealthy,
+		RedisHealthy:    redisHealthy,
 	})
 }
 

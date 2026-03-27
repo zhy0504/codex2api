@@ -155,6 +155,14 @@ func (db *DB) SetMaxOpenConns(n int) {
 	db.conn.SetMaxIdleConns(n / 2)
 }
 
+// Ping 检查 PostgreSQL 连通性
+func (db *DB) Ping(ctx context.Context) error {
+	if db == nil || db.conn == nil {
+		return fmt.Errorf("PostgreSQL 未初始化")
+	}
+	return db.conn.PingContext(ctx)
+}
+
 // migrate 自动建表
 func (db *DB) migrate(ctx context.Context) error {
 	query := `

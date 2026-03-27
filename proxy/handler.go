@@ -1043,10 +1043,13 @@ func (h *Handler) handleCompactResponse(c *gin.Context, body io.Reader, model, c
 
 // ==================== 通用辅助 ====================
 
-// parseRetryAfter 解析上游 429 响应中的重试时间（参考 CLIProxyAPI codex_executor.go:689-708）
-func parseRetryAfter(body []byte) time.Duration {
+// parseRetryAfter 解析上游 429 响应中的重试时间。
+// 返回值: (duration, ok)
+// - ok=true  表示解析到了明确重置时间（可能是短窗口，比如 30s）
+// - ok=false 表示未解析到可用值
+func parseRetryAfter(body []byte) (time.Duration, bool) {
 	if len(body) == 0 {
-		return 2 * time.Minute
+		return 0, false
 	}
 
 	// 解析 error.resets_at (Unix timestamp)
@@ -1055,18 +1058,17 @@ func parseRetryAfter(body []byte) time.Duration {
 		if resetTime.After(time.Now()) {
 			d := time.Until(resetTime)
 			if d > 0 {
-				return d
+				return d, true
 			}
 		}
 	}
 
 	// 解析 error.resets_in_seconds
 	if secs := gjson.GetBytes(body, "error.resets_in_seconds").Int(); secs > 0 {
-		return time.Duration(secs) * time.Second
+		return time.Duration(secs) * time.Second, true
 	}
 
-	// 默认 2 分钟
-	return 2 * time.Minute
+	return 0, false
 }
 
 // applyCooldown 根据上游状态码设置智能冷却
@@ -1083,9 +1085,11 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 
 // compute429Cooldown 根据计划类型和 Codex 响应精确计算 429 冷却时间
 func (h *Handler) compute429Cooldown(account *auth.Account, body []byte, resp *http.Response) time.Duration {
-	// 1. 优先使用 Codex 响应体中的精确重置时间
-	if resetDuration := parseRetryAfter(body); resetDuration > 2*time.Minute {
-		// parseRetryAfter 默认返回 2min（无数据），超过 2min 说明解析到了真实的 resets_at/resets_in_seconds
+	// 1. 优先使用 Codex 响应体中的精确重置时间（包括短窗口）
+	if resetDuration, ok := parseRetryAfter(body); ok {
+		if resetDuration < 5*time.Second {
+			resetDuration = 5 * time.Second
+		}
 		if resetDuration > 7*24*time.Hour {
 			resetDuration = 7 * 24 * time.Hour // 最多 7 天
 		}

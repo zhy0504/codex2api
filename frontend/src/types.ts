@@ -89,9 +89,11 @@ export interface AdminErrorResponse {
 }
 
 export interface HealthResponse {
-  status: 'ok' | string
+  status: 'ok' | 'degraded' | string
   available: number
   total: number
+  postgres_healthy: boolean
+  redis_healthy: boolean
 }
 
 export interface OpsOverviewResponse {
