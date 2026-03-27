@@ -1,6 +1,6 @@
 import type { ChangeEvent } from 'react'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, getAdminKey } from '../api'
+import { api } from '../api'
 import Modal from '../components/Modal'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
@@ -256,7 +256,7 @@ export default function Accounts() {
     try {
       const formData = new FormData()
       formData.append('file', file)
-      const res = await fetch('/api/admin/accounts/import', { method: 'POST', body: formData, headers: getAdminKey() ? { 'X-Admin-Key': getAdminKey() } : {} })
+      const res = await fetch('/api/admin/accounts/import', { method: 'POST', body: formData, credentials: 'same-origin' })
       const data = await res.json()
       if (!res.ok) {
         showToast(data.error ? t('accounts.importFailedWithReason', { error: data.error }) : t('accounts.importFailed'), 'error')
@@ -283,7 +283,7 @@ export default function Accounts() {
       for (let i = 0; i < files.length; i++) {
         formData.append('file', files[i])
       }
-      const res = await fetch('/api/admin/accounts/import', { method: 'POST', body: formData, headers: getAdminKey() ? { 'X-Admin-Key': getAdminKey() } : {} })
+      const res = await fetch('/api/admin/accounts/import', { method: 'POST', body: formData, credentials: 'same-origin' })
       const data = await res.json()
       if (!res.ok) {
         showToast(data.error ? t('accounts.importFailedWithReason', { error: data.error }) : t('accounts.importFailed'), 'error')
@@ -1101,7 +1101,7 @@ function TestConnectionModal({
       try {
         const res = await fetch(`/api/admin/accounts/${account.id}/test`, {
           signal: controller.signal,
-          headers: getAdminKey() ? { 'X-Admin-Key': getAdminKey() } : {},
+          credentials: 'same-origin',
         })
 
         if (!res.ok) {

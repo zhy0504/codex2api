@@ -37,6 +37,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的账号 ID"})
 		return
 	}
+	c.Set("x-account-id", id)
 
 	// 查找运行时账号
 	account := h.store.FindByID(id)

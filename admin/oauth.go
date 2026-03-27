@@ -13,7 +13,6 @@ import (
 	"net/http"
 	neturl "net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -31,7 +30,7 @@ const (
 	oauthSessionTTL         = 30 * time.Minute
 )
 
-// ==================== 内存 Session 存储 ====================
+// ==================== OAuth Session 存储 ====================
 
 type oauthSession struct {
 	State        string
@@ -41,50 +40,53 @@ type oauthSession struct {
 	CreatedAt    time.Time
 }
 
-type oauthSessionStore struct {
-	mu       sync.Mutex
-	sessions map[string]*oauthSession
-}
-
-var globalOAuthStore = &oauthSessionStore{sessions: make(map[string]*oauthSession)}
-
-func init() {
-	go globalOAuthStore.cleanupLoop()
-}
-
-func (s *oauthSessionStore) set(id string, sess *oauthSession) {
-	s.mu.Lock()
-	s.sessions[id] = sess
-	s.mu.Unlock()
-}
-
-func (s *oauthSessionStore) get(id string) (*oauthSession, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sess, ok := s.sessions[id]
-	if !ok || time.Since(sess.CreatedAt) > oauthSessionTTL {
-		return nil, false
+func (h *Handler) saveOAuthSession(ctx context.Context, sessionID string, sess *oauthSession) error {
+	if h.cache == nil {
+		return fmt.Errorf("Redis 缓存未初始化")
 	}
-	return sess, true
+	payload, err := json.Marshal(sess)
+	if err != nil {
+		return fmt.Errorf("序列化 OAuth 会话失败: %w", err)
+	}
+	if err := h.cache.SetOAuthSession(ctx, sessionID, string(payload), oauthSessionTTL); err != nil {
+		return fmt.Errorf("写入 OAuth 会话失败: %w", err)
+	}
+	return nil
 }
 
-func (s *oauthSessionStore) delete(id string) {
-	s.mu.Lock()
-	delete(s.sessions, id)
-	s.mu.Unlock()
+func (h *Handler) loadOAuthSession(ctx context.Context, sessionID string) (*oauthSession, error) {
+	if h.cache == nil {
+		return nil, fmt.Errorf("Redis 缓存未初始化")
+	}
+	raw, err := h.cache.GetOAuthSession(ctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("读取 OAuth 会话失败: %w", err)
+	}
+	if raw == "" {
+		return nil, nil
+	}
+
+	var sess oauthSession
+	if err := json.Unmarshal([]byte(raw), &sess); err != nil {
+		_ = h.cache.DeleteOAuthSession(ctx, sessionID)
+		return nil, fmt.Errorf("解析 OAuth 会话失败: %w", err)
+	}
+	if sess.CreatedAt.IsZero() || time.Since(sess.CreatedAt) > oauthSessionTTL {
+		_ = h.cache.DeleteOAuthSession(ctx, sessionID)
+		return nil, nil
+	}
+
+	return &sess, nil
 }
 
-func (s *oauthSessionStore) cleanupLoop() {
-	ticker := time.NewTicker(5 * time.Minute)
-	defer ticker.Stop()
-	for range ticker.C {
-		s.mu.Lock()
-		for id, sess := range s.sessions {
-			if time.Since(sess.CreatedAt) > oauthSessionTTL {
-				delete(s.sessions, id)
-			}
-		}
-		s.mu.Unlock()
+func (h *Handler) deleteOAuthSession(sessionID string) {
+	if h.cache == nil || sessionID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := h.cache.DeleteOAuthSession(ctx, sessionID); err != nil {
+		log.Printf("删除 OAuth 会话失败: session_id=%s err=%v", sessionID, err)
 	}
 }
 
@@ -135,13 +137,18 @@ func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 		return
 	}
 
-	globalOAuthStore.set(sessionID, &oauthSession{
+	storeCtx, storeCancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer storeCancel()
+	if err := h.saveOAuthSession(storeCtx, sessionID, &oauthSession{
 		State:        state,
 		CodeVerifier: codeVerifier,
 		RedirectURI:  redirectURI,
 		ProxyURL:     strings.TrimSpace(req.ProxyURL),
 		CreatedAt:    time.Now(),
-	})
+	}); err != nil {
+		writeError(c, http.StatusInternalServerError, "保存 OAuth 会话失败")
+		return
+	}
 
 	params := neturl.Values{}
 	params.Set("response_type", "code")
@@ -179,15 +186,23 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		return
 	}
 
-	sess, ok := globalOAuthStore.get(req.SessionID)
-	if !ok {
+	sessCtx, sessCancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer sessCancel()
+	sess, err := h.loadOAuthSession(sessCtx, req.SessionID)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "读取 OAuth 会话失败")
+		return
+	}
+	if sess == nil {
 		writeError(c, http.StatusBadRequest, "OAuth 会话不存在或已过期（有效期 30 分钟）")
 		return
 	}
 	if req.State != sess.State {
+		h.deleteOAuthSession(req.SessionID)
 		writeError(c, http.StatusBadRequest, "state 不匹配，请重新发起授权")
 		return
 	}
+	h.deleteOAuthSession(req.SessionID)
 
 	proxyURL := sess.ProxyURL
 	if trimmed := strings.TrimSpace(req.ProxyURL); trimmed != "" {
@@ -199,7 +214,6 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		writeError(c, http.StatusBadGateway, "授权码兑换失败: "+err.Error())
 		return
 	}
-	globalOAuthStore.delete(req.SessionID)
 
 	if tokenResp.RefreshToken == "" {
 		writeError(c, http.StatusBadGateway, "授权服务器未返回 refresh_token，请确认已开启 offline_access scope")

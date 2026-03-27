@@ -100,7 +100,7 @@ export default function Layout({ children }: PropsWithChildren) {
                   <Languages className="size-[18px]" />
                 </button>
                 <a
-                  href="https://github.com/james-6-23/codex2api"
+                  href="https://github.com/zhy0504/codex2api"
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex items-center justify-center size-9 rounded-xl text-muted-foreground hover:text-foreground hover:bg-white/60 dark:hover:bg-white/10 transition-all duration-150"

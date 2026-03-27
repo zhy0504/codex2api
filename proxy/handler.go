@@ -32,10 +32,20 @@ type Handler struct {
 }
 
 // NewHandler 创建处理器
-func NewHandler(store *auth.Store, db *database.DB) *Handler {
+
+func NewHandler(store *auth.Store, db *database.DB, staticKeys []string) *Handler {
+	configKeys := make(map[string]bool, len(staticKeys))
+	for _, key := range staticKeys {
+		v := strings.TrimSpace(key)
+		if v == "" {
+			continue
+		}
+		configKeys[v] = true
+	}
+
 	return &Handler{
 		store:      store,
-		configKeys: make(map[string]bool), // 不再使用硬编码，但保留结构以向后兼容逻辑
+		configKeys: configKeys,
 		db:         db,
 	}
 }
@@ -99,6 +109,26 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 		return
 	}
 	_ = h.db.InsertUsageLog(context.Background(), input)
+}
+
+func requestIDFromContext(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if v, ok := c.Get("x-request-id"); ok {
+		if s, ok := v.(string); ok {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
+}
+
+func requestLogPrefix(c *gin.Context) string {
+	requestID := requestIDFromContext(c)
+	if requestID == "" {
+		return ""
+	}
+	return fmt.Sprintf("[request_id=%s] ", requestID)
 }
 
 // extractReasoningEffort 从请求体提取推理强度
@@ -224,17 +254,23 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 // authMiddleware API Key 鉴权中间件
 func (h *Handler) authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// 如果没有配置任何密钥，跳过鉴权
 		if !h.hasAnyKeys() {
-			c.Next()
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": gin.H{
+					"message": "服务未配置 API Key，请先在管理后台创建密钥或设置 CODEX_API_KEYS",
+					"type":    "authentication_error",
+					"code":    "api_key_not_configured",
+				},
+			})
+			c.Abort()
 			return
 		}
 
 		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error": gin.H{
-					"message": "缺少 Authorization 头",
+					"message": "缺少或非法 Authorization 头，需使用 Bearer API Key",
 					"type":    "authentication_error",
 					"code":    "missing_api_key",
 				},
@@ -243,7 +279,7 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		key := strings.TrimPrefix(authHeader, "Bearer ")
+		key := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
 		if !h.isValidKey(key) {
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error": gin.H{
@@ -356,6 +392,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		start := time.Now()
 		proxyURL := h.store.NextProxy()
+		c.Set("x-account-id", account.ID())
 		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -364,7 +401,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
+			log.Printf("%s上游请求失败 (attempt %d, account %d, /v1/responses): %v", requestLogPrefix(c), attempt+1, account.ID(), reqErr)
 			lastErr = reqErr
 			continue
 		}
@@ -380,7 +417,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			resp.Body.Close()
 			h.store.Release(account)
 
-			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
+			log.Printf("%s上游返回错误 (attempt %d, account %d, status %d, /v1/responses): %s", requestLogPrefix(c), attempt+1, account.ID(), resp.StatusCode, string(errBody))
 			h.logUsage(&database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/responses",
@@ -407,6 +444,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		// 成功！透传响应并跟踪 TTFT / usage
 		account.Mu().RLock()
+		c.Set("x-account-id", account.ID())
 		c.Set("x-account-email", account.Email)
 		account.Mu().RUnlock()
 		c.Set("x-account-proxy", proxyURL)
@@ -516,7 +554,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, wroteAnyBody, c.Request.Context().Err(), writeErr) {
-			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			log.Printf("%s上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", requestLogPrefix(c), attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClientForAccount(account)
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)
@@ -532,7 +570,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
-			log.Printf("流异常结束 (account %d, /v1/responses, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
+			log.Printf("%s流异常结束 (account %d, /v1/responses, status %d): %s，已转发约 %d 字符", requestLogPrefix(c), account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
 			if deltaCharCount > 0 {
 				estOutputTokens := deltaCharCount / 3 // 粗略估算: 约 3 字符 = 1 token
 				if estOutputTokens < 1 {
@@ -658,6 +696,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		start := time.Now()
 		proxyURL := h.store.NextProxy()
+		c.Set("x-account-id", account.ID())
 		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -666,7 +705,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
+			log.Printf("%s上游请求失败 (attempt %d, account %d, /v1/chat/completions): %v", requestLogPrefix(c), attempt+1, account.ID(), reqErr)
 			lastErr = reqErr
 			continue
 		}
@@ -682,7 +721,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			resp.Body.Close()
 			h.store.Release(account)
 
-			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
+			log.Printf("%s上游返回错误 (attempt %d, account %d, status %d, /v1/chat/completions): %s", requestLogPrefix(c), attempt+1, account.ID(), resp.StatusCode, string(errBody))
 			h.logUsage(&database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/chat/completions",
@@ -709,6 +748,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		// 成功！翻译响应 + TTFT 跟踪
 		account.Mu().RLock()
+		c.Set("x-account-id", account.ID())
 		c.Set("x-account-email", account.Email)
 		account.Mu().RUnlock()
 		c.Set("x-account-proxy", proxyURL)
@@ -837,7 +877,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
 		if shouldTransparentRetryStream(outcome, attempt, wroteAnyBody, c.Request.Context().Err(), writeErr) {
-			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
+			log.Printf("%s上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", requestLogPrefix(c), attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClientForAccount(account)
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 				h.store.PersistUsageSnapshot(account, usagePct)
@@ -853,7 +893,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
-			log.Printf("流异常结束 (account %d, /v1/chat/completions, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
+			log.Printf("%s流异常结束 (account %d, /v1/chat/completions, status %d): %s，已转发约 %d 字符", requestLogPrefix(c), account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
 			if deltaCharCount > 0 {
 				estOutputTokens := deltaCharCount / 3
 				if estOutputTokens < 1 {
@@ -958,7 +998,7 @@ func (h *Handler) handleStreamResponse(c *gin.Context, body io.Reader, model, ch
 	})
 
 	if err != nil {
-		log.Printf("读取上游流失败: %v", err)
+		log.Printf("%s读取上游流失败: %v", requestLogPrefix(c), err)
 	}
 }
 

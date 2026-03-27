@@ -1,7 +1,7 @@
 import type { ChangeEvent, KeyboardEvent } from 'react'
 import { useCallback, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { api, setAdminKey } from '../api'
+import { api } from '../api'
 import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import ToastNotice from '../components/ToastNotice'
@@ -122,7 +122,6 @@ export default function Settings() {
     try {
       const updated = await api.updateSettings(settingsForm)
       setSettingsForm(updated)
-      setAdminKey(updated.admin_secret ?? '')
       showToast(t('settings.saveSuccess'))
     } catch (error) {
       showToast(`${t('settings.saveFailed')}: ${getErrorMessage(error)}`, 'error')

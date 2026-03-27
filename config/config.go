@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -38,9 +39,41 @@ type RedisConfig struct {
 // Config 全局核心环境配置（物理隔离的服务器参数）
 // 业务逻辑参数（如 ProxyURL，APIKeys，MaxConcurrency）已全部移至数据库 SystemSettings 进行化
 type Config struct {
-	Port     int
-	Database DatabaseConfig
-	Redis    RedisConfig
+	Port                     int
+	AppEnv                   string
+	BootstrapAdminSecret     string
+	CredentialsEncryptionKey string
+	StaticAPIKeys            []string
+	CORSAllowedOrigins       []string
+	Database                 DatabaseConfig
+	Redis                    RedisConfig
+}
+
+// IsProduction 判断当前是否为生产环境
+func (c *Config) IsProduction() bool {
+	if c == nil {
+		return false
+	}
+	env := strings.ToLower(strings.TrimSpace(c.AppEnv))
+	return env == "production" || env == "prod"
+}
+
+func parseCommaSeparated(value string) []string {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	seen := make(map[string]bool, len(parts))
+	for _, p := range parts {
+		v := strings.TrimSpace(p)
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 // Load 从 .env 文件加载核心环境配置，支持环境变量覆盖
@@ -49,9 +82,17 @@ func Load(envPath string) (*Config, error) {
 	if envPath == "" {
 		envPath = ".env"
 	}
-	_ = godotenv.Load(envPath) 
+	_ = godotenv.Load(envPath)
 
-	cfg := &Config{Port: 8080}
+	cfg := &Config{Port: 8080, AppEnv: "development"}
+
+	if env := strings.TrimSpace(os.Getenv("APP_ENV")); env != "" {
+		cfg.AppEnv = strings.ToLower(env)
+	}
+	cfg.BootstrapAdminSecret = strings.TrimSpace(os.Getenv("ADMIN_SECRET"))
+	cfg.CredentialsEncryptionKey = strings.TrimSpace(os.Getenv("CREDENTIALS_ENCRYPTION_KEY"))
+	cfg.StaticAPIKeys = parseCommaSeparated(os.Getenv("CODEX_API_KEYS"))
+	cfg.CORSAllowedOrigins = parseCommaSeparated(os.Getenv("CORS_ALLOWED_ORIGINS"))
 
 	// Web服务端口
 	if port := os.Getenv("CODEX_PORT"); port != "" {

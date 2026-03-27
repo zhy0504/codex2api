@@ -3,8 +3,10 @@ package admin
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -25,14 +27,15 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	store         *auth.Store
-	cache         *cache.TokenCache
-	db            *database.DB
-	rateLimiter   *proxy.RateLimiter
-	cpuSampler    *cpuSampler
-	startedAt     time.Time
-	pgMaxConns    int
-	redisPoolSize int
+	store                *auth.Store
+	cache                *cache.TokenCache
+	db                   *database.DB
+	rateLimiter          *proxy.RateLimiter
+	bootstrapAdminSecret string
+	cpuSampler           *cpuSampler
+	startedAt            time.Time
+	pgMaxConns           int
+	redisPoolSize        int
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -44,16 +47,32 @@ type chartCacheEntry struct {
 	expiresAt time.Time
 }
 
+const (
+	adminSessionCookieName = "codex2api_admin_session"
+	adminSessionTTL        = 12 * time.Hour
+)
+
+var errAdminSecretNotConfigured = errors.New("admin secret not configured")
+
+func adminSessionValue(adminSecret string) string {
+	if strings.TrimSpace(adminSecret) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(adminSecret)))
+	return hex.EncodeToString(sum[:])
+}
+
 // NewHandler 创建管理后台处理器
-func NewHandler(store *auth.Store, db *database.DB, tc *cache.TokenCache, rl *proxy.RateLimiter) *Handler {
+func NewHandler(store *auth.Store, db *database.DB, tc *cache.TokenCache, rl *proxy.RateLimiter, bootstrapAdminSecret string) *Handler {
 	return &Handler{
-		store:          store,
-		cache:          tc,
-		db:             db,
-		rateLimiter:    rl,
-		cpuSampler:     newCPUSampler(),
-		startedAt:      time.Now(),
-		chartCacheData: make(map[string]*chartCacheEntry),
+		store:                store,
+		cache:                tc,
+		db:                   db,
+		rateLimiter:          rl,
+		bootstrapAdminSecret: strings.TrimSpace(bootstrapAdminSecret),
+		cpuSampler:           newCPUSampler(),
+		startedAt:            time.Now(),
+		chartCacheData:       make(map[string]*chartCacheEntry),
 	}
 }
 
@@ -66,6 +85,10 @@ func (h *Handler) SetPoolSizes(pgMaxConns, redisPoolSize int) {
 // RegisterRoutes 注册管理 API 路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api := r.Group("/api/admin")
+	api.POST("/auth/login", h.AdminLogin)
+	api.POST("/auth/logout", h.AdminLogout)
+	api.GET("/auth/session", h.AdminSession)
+
 	api.Use(h.adminAuthMiddleware())
 	api.GET("/stats", h.GetStats)
 	api.GET("/accounts", h.ListAccounts)
@@ -102,35 +125,189 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/oauth/exchange-code", h.ExchangeOAuthCode)
 }
 
+func (h *Handler) expectedAdminSecret(ctx context.Context) (string, error) {
+	settings, err := h.db.GetSystemSettings(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	expectedSecret := h.bootstrapAdminSecret
+	if settings != nil && strings.TrimSpace(settings.AdminSecret) != "" {
+		expectedSecret = strings.TrimSpace(settings.AdminSecret)
+	}
+	expectedSecret = strings.TrimSpace(expectedSecret)
+	if expectedSecret == "" {
+		return "", errAdminSecretNotConfigured
+	}
+
+	return expectedSecret, nil
+}
+
+func isHTTPSRequest(c *gin.Context) bool {
+	if c != nil && c.Request != nil && c.Request.TLS != nil {
+		return true
+	}
+	if c == nil {
+		return false
+	}
+	return strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
+}
+
+func setAdminSessionCookie(c *gin.Context, adminSecret string) {
+	if c == nil {
+		return
+	}
+	sessionVal := adminSessionValue(adminSecret)
+	if sessionVal == "" {
+		clearAdminSessionCookie(c)
+		return
+	}
+	c.SetSameSite(http.SameSiteStrictMode)
+	c.SetCookie(
+		adminSessionCookieName,
+		sessionVal,
+		int(adminSessionTTL.Seconds()),
+		"/",
+		"",
+		isHTTPSRequest(c),
+		true,
+	)
+}
+
+func clearAdminSessionCookie(c *gin.Context) {
+	if c == nil {
+		return
+	}
+	c.SetSameSite(http.SameSiteStrictMode)
+	c.SetCookie(adminSessionCookieName, "", -1, "/", "", isHTTPSRequest(c), true)
+}
+
+// AdminLogin 管理后台登录（签发 HttpOnly Cookie）
+func (h *Handler) AdminLogin(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+
+	expectedSecret, err := h.expectedAdminSecret(ctx)
+	if err != nil {
+		if errors.Is(err, errAdminSecretNotConfigured) {
+			writeError(c, http.StatusUnauthorized, "管理密钥未配置，请先设置 ADMIN_SECRET 或在系统设置中配置 admin_secret")
+			return
+		}
+		writeError(c, http.StatusUnauthorized, "管理鉴权暂不可用，请稍后重试")
+		return
+	}
+
+	var req struct {
+		AdminKey string `json:"admin_key"`
+	}
+	_ = c.ShouldBindJSON(&req)
+
+	provided := strings.TrimSpace(req.AdminKey)
+	if provided == "" {
+		provided = strings.TrimSpace(c.GetHeader("X-Admin-Key"))
+	}
+	if provided == "" {
+		authHeader := strings.TrimSpace(c.GetHeader("Authorization"))
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			provided = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+		}
+	}
+
+	if provided == "" || provided != expectedSecret {
+		clearAdminSessionCookie(c)
+		writeError(c, http.StatusUnauthorized, "管理密钥无效或缺失")
+		return
+	}
+
+	setAdminSessionCookie(c, expectedSecret)
+	writeMessage(c, http.StatusOK, "登录成功")
+}
+
+// AdminLogout 管理后台登出（清理 Cookie）
+func (h *Handler) AdminLogout(c *gin.Context) {
+	clearAdminSessionCookie(c)
+	writeMessage(c, http.StatusOK, "已退出登录")
+}
+
+// AdminSession 返回管理会话状态
+func (h *Handler) AdminSession(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+
+	expectedSecret, err := h.expectedAdminSecret(ctx)
+	if err != nil {
+		clearAdminSessionCookie(c)
+		c.JSON(http.StatusUnauthorized, gin.H{"authenticated": false})
+		return
+	}
+
+	sessionSecret, cookieErr := c.Cookie(adminSessionCookieName)
+	if cookieErr != nil || strings.TrimSpace(sessionSecret) == "" || strings.TrimSpace(sessionSecret) != adminSessionValue(expectedSecret) {
+		clearAdminSessionCookie(c)
+		c.JSON(http.StatusUnauthorized, gin.H{"authenticated": false})
+		return
+	}
+
+	setAdminSessionCookie(c, expectedSecret)
+	c.JSON(http.StatusOK, gin.H{"authenticated": true})
+}
+
 // adminAuthMiddleware 管理接口鉴权中间件
 func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
 		defer cancel()
 
-		settings, err := h.db.GetSystemSettings(ctx)
-		if err != nil || settings == nil || settings.AdminSecret == "" {
-			// 未配置管理密钥，跳过鉴权
+		expectedSecret, err := h.expectedAdminSecret(ctx)
+		if err != nil {
+			if errors.Is(err, errAdminSecretNotConfigured) {
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"error": "管理密钥未配置，请先设置 ADMIN_SECRET 或在系统设置中配置 admin_secret",
+				})
+				c.Abort()
+				return
+			}
+			c.JSON(http.StatusUnauthorized, gin.H{
+				"error": "管理鉴权暂不可用，请稍后重试",
+			})
+			c.Abort()
+			return
+		}
+
+		adminKey := strings.TrimSpace(c.GetHeader("X-Admin-Key"))
+		usedHeaderAuth := adminKey != ""
+		if !usedHeaderAuth {
+			// 兼容 Authorization: Bearer 方式
+			authHeader := strings.TrimSpace(c.GetHeader("Authorization"))
+			if strings.HasPrefix(authHeader, "Bearer ") {
+				adminKey = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+				usedHeaderAuth = adminKey != ""
+			}
+		}
+
+		if usedHeaderAuth {
+			if adminKey == "" || adminKey != expectedSecret {
+				c.JSON(http.StatusUnauthorized, gin.H{
+					"error": "管理密钥无效或缺失",
+				})
+				c.Abort()
+				return
+			}
 			c.Next()
 			return
 		}
 
-		adminKey := c.GetHeader("X-Admin-Key")
-		if adminKey == "" {
-			// 兼容 Authorization: Bearer 方式
-			authHeader := c.GetHeader("Authorization")
-			if strings.HasPrefix(authHeader, "Bearer ") {
-				adminKey = strings.TrimPrefix(authHeader, "Bearer ")
-			}
-		}
-
-		if adminKey != settings.AdminSecret {
+		sessionSecret, cookieErr := c.Cookie(adminSessionCookieName)
+		if cookieErr != nil || strings.TrimSpace(sessionSecret) == "" || strings.TrimSpace(sessionSecret) != adminSessionValue(expectedSecret) {
+			clearAdminSessionCookie(c)
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error": "管理密钥无效或缺失",
 			})
 			c.Abort()
 			return
 		}
+
+		setAdminSessionCookie(c, expectedSecret)
 		c.Next()
 	}
 }
@@ -640,6 +817,7 @@ func (h *Handler) GetAccountUsage(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "无效的账号 ID")
 		return
 	}
+	c.Set("x-account-id", id)
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
@@ -660,6 +838,7 @@ func (h *Handler) DeleteAccount(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "无效的账号 ID")
 		return
 	}
+	c.Set("x-account-id", id)
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -684,11 +863,57 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "无效的账号 ID")
 		return
 	}
+	c.Set("x-account-id", id)
 
-	// 查找运行时账号并触发刷新
-	_ = id // TODO: 实现通过 ID 查找运行时 Account 并触发刷新
+	account := h.store.FindByID(id)
+	if account == nil {
+		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
 
-	writeMessage(c, http.StatusOK, "刷新请求已发送")
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 45*time.Second)
+	defer cancel()
+
+	if err := h.store.RefreshSingle(ctx, id); err != nil {
+		switch {
+		case errors.Is(err, context.DeadlineExceeded), errors.Is(ctx.Err(), context.DeadlineExceeded):
+			writeError(c, http.StatusGatewayTimeout, "刷新超时，请稍后重试")
+		case errors.Is(err, context.Canceled), errors.Is(ctx.Err(), context.Canceled):
+			writeError(c, http.StatusRequestTimeout, "刷新已取消")
+		default:
+			writeError(c, http.StatusBadGateway, "刷新失败: "+err.Error())
+		}
+		return
+	}
+
+	refreshed := h.store.FindByID(id)
+	if refreshed == nil {
+		writeMessage(c, http.StatusOK, "刷新成功")
+		return
+	}
+
+	refreshed.Mu().RLock()
+	email := refreshed.Email
+	planType := refreshed.PlanType
+	hasAccessToken := refreshed.AccessToken != ""
+	expiresAt := refreshed.ExpiresAt
+	refreshed.Mu().RUnlock()
+
+	accountInfo := gin.H{
+		"id":               id,
+		"email":            email,
+		"plan_type":        planType,
+		"status":           refreshed.RuntimeStatus(),
+		"has_access_token": hasAccessToken,
+	}
+	if !expiresAt.IsZero() {
+		accountInfo["expires_at"] = expiresAt.Format(time.RFC3339)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "刷新成功",
+		"account": accountInfo,
+	})
 }
 
 // ==================== Health ====================

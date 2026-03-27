@@ -23,6 +23,8 @@ Thumbs.db
 # Docker
 docker-compose.yml
 .dockerignore
+build/
+dist/
 
 # Go binaries
 *.exe

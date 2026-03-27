@@ -52,6 +52,8 @@ func (a *AccountRow) GetCredential(key string) string {
 type DB struct {
 	conn *sql.DB
 
+	credentialCipher *credentialCipher
+
 	// 使用日志批量写入缓冲
 	logBuf  []usageLogEntry
 	logMu   sync.Mutex
@@ -1016,15 +1018,15 @@ type UsageLogPage struct {
 
 // UsageLogFilter 日志查询过滤条件
 type UsageLogFilter struct {
-	Start    time.Time
-	End      time.Time
-	Page     int
-	PageSize int
-	Email    string // LIKE 模糊匹配
-	Model    string // 精确匹配
-	Endpoint string // 精确匹配 inbound_endpoint
-	FastOnly   *bool // nil=全部, true=仅fast, false=仅非fast
-	StreamOnly *bool // nil=全部, true=仅stream, false=仅sync
+	Start      time.Time
+	End        time.Time
+	Page       int
+	PageSize   int
+	Email      string // LIKE 模糊匹配
+	Model      string // 精确匹配
+	Endpoint   string // 精确匹配 inbound_endpoint
+	FastOnly   *bool  // nil=全部, true=仅fast, false=仅非fast
+	StreamOnly *bool  // nil=全部, true=仅stream, false=仅sync
 }
 
 // ListUsageLogsByTimeRangePaged 按时间范围分页查询请求日志（支持筛选）
@@ -1208,6 +1210,7 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			log.Printf("[账号 %d] 解析 credentials 失败: %v", a.ID, err)
 			a.Credentials = make(map[string]interface{})
 		}
+		db.decryptCredentialMapInPlace(a.ID, a.Credentials)
 		accounts = append(accounts, a)
 	}
 	return accounts, rows.Err()
@@ -1216,7 +1219,12 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 // UpdateCredentials 原子合并更新账号的 credentials（JSONB || 运算符，不覆盖已有字段）
 // 解决并发刷新时一个进程覆盖另一个进程写入的字段的问题
 func (db *DB) UpdateCredentials(ctx context.Context, id int64, credentials map[string]interface{}) error {
-	credJSON, err := json.Marshal(credentials)
+	encCredentials, _, err := db.encryptCredentialMap(credentials)
+	if err != nil {
+		return fmt.Errorf("加密 credentials 失败: %w", err)
+	}
+
+	credJSON, err := json.Marshal(encCredentials)
 	if err != nil {
 		return fmt.Errorf("序列化 credentials 失败: %w", err)
 	}
@@ -1240,9 +1248,9 @@ func (db *DB) UpdateUsageSnapshot(ctx context.Context, id int64, pct7d float64, 
 func (db *DB) UpdateUsageSnapshotFull(ctx context.Context, id int64, pct7d float64, reset7dAt time.Time, pct5h float64, reset5hAt time.Time, updatedAt time.Time) error {
 	fields := map[string]interface{}{
 		"codex_7d_used_percent":  pct7d,
-		"codex_7d_reset_at":     reset7dAt.Format(time.RFC3339),
+		"codex_7d_reset_at":      reset7dAt.Format(time.RFC3339),
 		"codex_5h_used_percent":  pct5h,
-		"codex_5h_reset_at":     reset5hAt.Format(time.RFC3339),
+		"codex_5h_reset_at":      reset5hAt.Format(time.RFC3339),
 		"codex_usage_updated_at": updatedAt.Format(time.RFC3339),
 	}
 	return db.UpdateCredentials(ctx, id, fields)
@@ -1281,7 +1289,12 @@ func (db *DB) InsertAccount(ctx context.Context, name string, refreshToken strin
 	credentials := map[string]interface{}{
 		"refresh_token": refreshToken,
 	}
-	credJSON, err := json.Marshal(credentials)
+	encryptedCredentials, _, err := db.encryptCredentialMap(credentials)
+	if err != nil {
+		return 0, fmt.Errorf("加密 refresh_token 失败: %w", err)
+	}
+
+	credJSON, err := json.Marshal(encryptedCredentials)
 	if err != nil {
 		return 0, err
 	}
@@ -1301,7 +1314,7 @@ func (db *DB) CountAll(ctx context.Context) (int, error) {
 
 // GetAllRefreshTokens 获取所有已存在的 refresh_token（用于导入去重）
 func (db *DB) GetAllRefreshTokens(ctx context.Context) (map[string]bool, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT credentials->>'refresh_token' FROM accounts WHERE credentials->>'refresh_token' IS NOT NULL`)
+	rows, err := db.conn.QueryContext(ctx, `SELECT id, credentials FROM accounts WHERE status = 'active'`)
 	if err != nil {
 		return nil, err
 	}
@@ -1309,8 +1322,20 @@ func (db *DB) GetAllRefreshTokens(ctx context.Context) (map[string]bool, error) 
 
 	result := make(map[string]bool)
 	for rows.Next() {
-		var rt string
-		if err := rows.Scan(&rt); err == nil && rt != "" {
+		var id int64
+		var credJSON []byte
+		if err := rows.Scan(&id, &credJSON); err != nil {
+			return nil, err
+		}
+
+		credMap := make(map[string]interface{})
+		if err := json.Unmarshal(credJSON, &credMap); err != nil {
+			log.Printf("[账号 %d] 解析 credentials 失败（导入去重）: %v", id, err)
+			continue
+		}
+		db.decryptCredentialMapInPlace(id, credMap)
+
+		if rt, ok := credMap["refresh_token"].(string); ok && rt != "" {
 			result[rt] = true
 		}
 	}

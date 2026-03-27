@@ -21,16 +21,13 @@ import type {
 
 const BASE = '/api/admin'
 
+// 已弃用：保留导出仅用于兼容旧调用方
 export function getAdminKey(): string {
-  return localStorage.getItem('admin_key') ?? ''
+  return ''
 }
 
-export function setAdminKey(key: string) {
-  if (key) {
-    localStorage.setItem('admin_key', key)
-  } else {
-    localStorage.removeItem('admin_key')
-  }
+// 已弃用：管理鉴权改为 HttpOnly Cookie，会话由后端维护
+export function setAdminKey(_key: string) {
 }
 
 function extractAdminErrorMessage(body: string, status: number): string {
@@ -56,14 +53,10 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     headers.set('Content-Type', 'application/json')
   }
 
-  const adminKey = getAdminKey()
-  if (adminKey) {
-    headers.set('X-Admin-Key', adminKey)
-  }
-
   const res = await fetch(BASE + path, {
     ...options,
     headers,
+    credentials: 'same-origin',
   })
 
   if (!res.ok) {
@@ -75,6 +68,12 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
+  loginAdmin: (adminKey: string) =>
+    request<MessageResponse>('/auth/login', { method: 'POST', body: JSON.stringify({ admin_key: adminKey }) }),
+  logoutAdmin: () =>
+    request<MessageResponse>('/auth/logout', { method: 'POST' }),
+  getAdminSession: () =>
+    request<{ authenticated: boolean }>('/auth/session'),
   getStats: () => request<StatsResponse>('/stats'),
   getAccounts: () => request<AccountsResponse>('/accounts'),
   addAccount: (data: AddAccountRequest) =>

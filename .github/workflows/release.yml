@@ -33,13 +33,23 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: npm run typecheck
+
       - name: Build frontend
         working-directory: frontend
         env:
           VITE_APP_VERSION: ${{ github.ref_name }}
         run: |
-          npm ci
           npm run build
+
+      - name: Go test
+        run: go test ./...
 
       - name: Build release assets
         shell: bash

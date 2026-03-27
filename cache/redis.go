@@ -94,6 +94,10 @@ func refreshLockKey(accountID int64) string {
 	return fmt.Sprintf("codex:refresh_lock:%d", accountID)
 }
 
+func oauthSessionKey(sessionID string) string {
+	return fmt.Sprintf("codex:oauth_session:%s", sessionID)
+}
+
 // AcquireRefreshLock 获取刷新锁（防止并发刷新同一账号）
 func (tc *TokenCache) AcquireRefreshLock(ctx context.Context, accountID int64, ttl time.Duration) (bool, error) {
 	ok, err := tc.client.SetNX(ctx, refreshLockKey(accountID), "1", ttl).Result()
@@ -135,4 +139,46 @@ func (tc *TokenCache) WaitForRefreshComplete(ctx context.Context, accountID int6
 		}
 	}
 	return "", fmt.Errorf("等待刷新超时")
+}
+
+// ==================== OAuth 会话缓存 ====================
+
+// SetOAuthSession 保存 OAuth 会话
+func (tc *TokenCache) SetOAuthSession(ctx context.Context, sessionID, payload string, ttl time.Duration) error {
+	if tc == nil || tc.client == nil {
+		return fmt.Errorf("Redis 未初始化")
+	}
+	if sessionID == "" {
+		return fmt.Errorf("sessionID 不能为空")
+	}
+	if ttl <= 0 {
+		ttl = 30 * time.Minute
+	}
+	return tc.client.Set(ctx, oauthSessionKey(sessionID), payload, ttl).Err()
+}
+
+// GetOAuthSession 读取 OAuth 会话
+func (tc *TokenCache) GetOAuthSession(ctx context.Context, sessionID string) (string, error) {
+	if tc == nil || tc.client == nil {
+		return "", fmt.Errorf("Redis 未初始化")
+	}
+	if sessionID == "" {
+		return "", nil
+	}
+	val, err := tc.client.Get(ctx, oauthSessionKey(sessionID)).Result()
+	if err == redis.Nil {
+		return "", nil
+	}
+	return val, err
+}
+
+// DeleteOAuthSession 删除 OAuth 会话
+func (tc *TokenCache) DeleteOAuthSession(ctx context.Context, sessionID string) error {
+	if tc == nil || tc.client == nil {
+		return fmt.Errorf("Redis 未初始化")
+	}
+	if sessionID == "" {
+		return nil
+	}
+	return tc.client.Del(ctx, oauthSessionKey(sessionID)).Err()
 }

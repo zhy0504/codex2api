@@ -1,11 +1,16 @@
 services:
   codex2api:
-    image: ghcr.io/james-6-23/codex2api:latest
+    image: "${CODEX2API_IMAGE:-ghcr.io/zhy0504/codex2api}:${CODEX2API_TAG:?set_CODEX2API_TAG}"
     container_name: codex2api
     ports:
       - "${CODEX_PORT:-8080}:${CODEX_PORT:-8080}"
     env_file:
       - .env
+    environment:
+      APP_ENV: production
+      ADMIN_SECRET: ${ADMIN_SECRET:?set ADMIN_SECRET}
+      CREDENTIALS_ENCRYPTION_KEY: ${CREDENTIALS_ENCRYPTION_KEY:?set CREDENTIALS_ENCRYPTION_KEY}
+      CODEX_API_KEYS: ${CODEX_API_KEYS:?set CODEX_API_KEYS}
     depends_on:
       postgres:
         condition: service_healthy
