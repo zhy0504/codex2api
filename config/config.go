@@ -1,8 +1,12 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -76,6 +80,89 @@ func parseCommaSeparated(value string) []string {
 	return out
 }
 
+func credentialsEncryptionKeyFilePath() string {
+	if v := strings.TrimSpace(os.Getenv("CREDENTIALS_ENCRYPTION_KEY_FILE")); v != "" {
+		return v
+	}
+	home, err := os.UserHomeDir()
+	if err == nil && strings.TrimSpace(home) != "" {
+		return filepath.Join(home, ".codex2api", "credentials_encryption_key")
+	}
+	return ".credentials_encryption_key"
+}
+
+func readCredentialsEncryptionKeyFile(path string) (string, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	key := strings.TrimSpace(string(content))
+	if key == "" {
+		return "", fmt.Errorf("凭据加密密钥文件为空: %s", path)
+	}
+	if len(key) < 32 {
+		return "", fmt.Errorf("凭据加密密钥长度不足（至少 32 字符）: %s", path)
+	}
+	return key, nil
+}
+
+func generateCredentialsEncryptionKey() (string, error) {
+	buf := make([]byte, 48)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("生成凭据加密密钥失败: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+func writeCredentialsEncryptionKeyFile(path, key string) error {
+	if key == "" {
+		return errors.New("凭据加密密钥不能为空")
+	}
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("创建凭据加密密钥目录失败 (%s): %w", dir, err)
+		}
+	}
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("写入凭据加密密钥文件失败 (%s): %w", path, err)
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(key + "\n"); err != nil {
+		return fmt.Errorf("写入凭据加密密钥内容失败 (%s): %w", path, err)
+	}
+	return nil
+}
+
+func resolveCredentialsEncryptionKey() (string, error) {
+	if v := strings.TrimSpace(os.Getenv("CREDENTIALS_ENCRYPTION_KEY")); v != "" {
+		return v, nil
+	}
+
+	keyFilePath := credentialsEncryptionKeyFilePath()
+	if key, err := readCredentialsEncryptionKeyFile(keyFilePath); err == nil {
+		return key, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+
+	generated, err := generateCredentialsEncryptionKey()
+	if err != nil {
+		return "", err
+	}
+
+	if err := writeCredentialsEncryptionKeyFile(keyFilePath, generated); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return readCredentialsEncryptionKeyFile(keyFilePath)
+		}
+		return "", err
+	}
+
+	return generated, nil
+}
+
 // Load 从 .env 文件加载核心环境配置，支持环境变量覆盖
 func Load(envPath string) (*Config, error) {
 	// 尝试加载 .env 文件（可选，如果文件不存在则忽略并使用当前环境变量）
@@ -90,7 +177,11 @@ func Load(envPath string) (*Config, error) {
 		cfg.AppEnv = strings.ToLower(env)
 	}
 	cfg.BootstrapAdminSecret = strings.TrimSpace(os.Getenv("ADMIN_SECRET"))
-	cfg.CredentialsEncryptionKey = strings.TrimSpace(os.Getenv("CREDENTIALS_ENCRYPTION_KEY"))
+	credentialsKey, err := resolveCredentialsEncryptionKey()
+	if err != nil {
+		return nil, err
+	}
+	cfg.CredentialsEncryptionKey = credentialsKey
 	cfg.StaticAPIKeys = parseCommaSeparated(os.Getenv("CODEX_API_KEYS"))
 	cfg.CORSAllowedOrigins = parseCommaSeparated(os.Getenv("CORS_ALLOWED_ORIGINS"))
 

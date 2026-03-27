@@ -95,6 +95,7 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | `CODEX2API_TAG` | Docker 镜像版本标签（建议固定版本，不用 latest） |
 | `ADMIN_SECRET` | 管理后台密钥（可用于首次初始化） |
 | `CREDENTIALS_ENCRYPTION_KEY` | 凭据加密密钥（用于加密存储 refresh/access/id_token，建议 32+ 长度） |
+| `CREDENTIALS_ENCRYPTION_KEY_FILE` | 可选。未设置 `CREDENTIALS_ENCRYPTION_KEY` 时，自动生成并持久化密钥的文件路径 |
 | `CODEX_API_KEYS` | 静态 API Keys（逗号分隔，可作为数据库 key 的补充） |
 | `CORS_ALLOWED_ORIGINS` | 允许跨域来源（逗号分隔，默认仅同源） |
 | `DATABASE_HOST` | PostgreSQL 主机 |
@@ -121,9 +122,11 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 - **对外 API Key**：`/v1/*` 始终要求 `Authorization: Bearer sk-xxx`。密钥来源为数据库 `api_keys` 与环境变量 `CODEX_API_KEYS`（二者任一命中即可）。
 - **管理后台 Admin Secret**：`/api/admin/*` 始终要求鉴权。支持两种方式：`X-Admin-Key` 请求头，或通过 `/api/admin/auth/login` 登录后使用 HttpOnly 会话 Cookie。密钥优先使用数据库 `AdminSecret`，为空时回退到环境变量 `ADMIN_SECRET`。
 - **凭据加密**：账号凭据中的 `refresh_token` / `access_token` / `id_token` 以加密格式落库；首次启用密钥会自动迁移历史明文值。
+  - 若未配置 `CREDENTIALS_ENCRYPTION_KEY`，服务会在首次启动自动生成一份高强度密钥并保存到 `CREDENTIALS_ENCRYPTION_KEY_FILE`（默认：`~/.codex2api/credentials_encryption_key`），后续启动复用该密钥。
+  - Compose 模板已默认挂载持久化卷 `codex2api-secrets` 并注入 `CREDENTIALS_ENCRYPTION_KEY_FILE=/home/codex/.codex2api/credentials_encryption_key`，因此可不在 `.env` 明文填写该密钥。
 - **CORS 策略**：默认仅允许同源请求；跨域需显式配置 `CORS_ALLOWED_ORIGINS`。
 - **生产环境安全基线**：当 `APP_ENV=production` 时，若缺少 `Admin Secret`、`API Key` 或 `CREDENTIALS_ENCRYPTION_KEY`，服务将拒绝启动。
-- **Compose 启动校验**：`docker-compose.yml` 会在启动前校验 `CODEX2API_TAG`、`ADMIN_SECRET`、`CREDENTIALS_ENCRYPTION_KEY`、`CODEX_API_KEYS` 是否已配置。
+- **Compose 启动校验**：`docker-compose.yml` 会在启动前校验 `CODEX2API_TAG`、`ADMIN_SECRET`、`CODEX_API_KEYS` 是否已配置。
 
 ---
 

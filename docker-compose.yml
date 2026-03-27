@@ -9,8 +9,10 @@ services:
     environment:
       APP_ENV: production
       ADMIN_SECRET: ${ADMIN_SECRET:?set ADMIN_SECRET}
-      CREDENTIALS_ENCRYPTION_KEY: ${CREDENTIALS_ENCRYPTION_KEY:?set CREDENTIALS_ENCRYPTION_KEY}
       CODEX_API_KEYS: ${CODEX_API_KEYS:?set CODEX_API_KEYS}
+      CREDENTIALS_ENCRYPTION_KEY_FILE: /home/codex/.codex2api/credentials_encryption_key
+    volumes:
+      - codex2api-secrets:/home/codex/.codex2api
     depends_on:
       postgres:
         condition: service_healthy
@@ -65,5 +67,6 @@ networks:
     driver: bridge
 
 volumes:
+  codex2api-secrets:
   pgdata:
   redisdata:

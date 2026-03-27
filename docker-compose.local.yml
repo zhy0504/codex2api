@@ -8,6 +8,9 @@ services:
       - .env
     environment:
       APP_ENV: development
+      CREDENTIALS_ENCRYPTION_KEY_FILE: /home/codex/.codex2api/credentials_encryption_key
+    volumes:
+      - codex2api-secrets:/home/codex/.codex2api
     depends_on:
       postgres:
         condition: service_healthy
@@ -62,5 +65,6 @@ networks:
     driver: bridge
 
 volumes:
+  codex2api-secrets:
   pgdata:
   redisdata:

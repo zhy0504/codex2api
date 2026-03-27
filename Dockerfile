@@ -42,6 +42,7 @@ FROM alpine:3.19
 
 RUN apk --no-cache add ca-certificates tzdata
 RUN addgroup -S codex && adduser -S -G codex -u 10001 codex
+RUN mkdir -p /home/codex/.codex2api && chown -R codex:codex /home/codex
 
 COPY --from=go-builder /codex2api /usr/local/bin/codex2api
 RUN chown codex:codex /usr/local/bin/codex2api
