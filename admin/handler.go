@@ -28,7 +28,7 @@ import (
 // Handler 管理后台 API 处理器
 type Handler struct {
 	store                *auth.Store
-	cache                *cache.TokenCache
+	cache                cache.TokenCache
 	db                   *database.DB
 	rateLimiter          *proxy.RateLimiter
 	bootstrapAdminSecret string
@@ -36,6 +36,11 @@ type Handler struct {
 	startedAt            time.Time
 	pgMaxConns           int
 	redisPoolSize        int
+	databaseDriver       string
+	databaseLabel        string
+	cacheDriver          string
+	cacheLabel           string
+	refreshAccount       func(context.Context, int64) error
 
 	// 图表聚合内存缓存（10秒 TTL）
 	chartCacheMu   sync.RWMutex
@@ -63,8 +68,8 @@ func adminSessionValue(adminSecret string) string {
 }
 
 // NewHandler 创建管理后台处理器
-func NewHandler(store *auth.Store, db *database.DB, tc *cache.TokenCache, rl *proxy.RateLimiter, bootstrapAdminSecret string) *Handler {
-	return &Handler{
+func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, bootstrapAdminSecret string) *Handler {
+	h := &Handler{
 		store:                store,
 		cache:                tc,
 		db:                   db,
@@ -74,6 +79,24 @@ func NewHandler(store *auth.Store, db *database.DB, tc *cache.TokenCache, rl *pr
 		startedAt:            time.Now(),
 		chartCacheData:       make(map[string]*chartCacheEntry),
 	}
+
+	h.refreshAccount = func(ctx context.Context, id int64) error {
+		if h.store == nil {
+			return fmt.Errorf("账号池未初始化")
+		}
+		return h.store.RefreshSingle(ctx, id)
+	}
+
+	if db != nil {
+		h.databaseDriver = db.Driver()
+		h.databaseLabel = db.Label()
+	}
+	if tc != nil {
+		h.cacheDriver = tc.Driver()
+		h.cacheLabel = tc.Label()
+	}
+
+	return h
 }
 
 // SetPoolSizes 设置连接池大小跟踪值（由 main.go 在启动时调用）
@@ -865,30 +888,42 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 	}
 	c.Set("x-account-id", id)
 
-	account := h.store.FindByID(id)
-	if account == nil {
-		writeError(c, http.StatusNotFound, "账号不在运行时池中")
-		return
+	if h.store != nil {
+		account := h.store.FindByID(id)
+		if account == nil {
+			writeError(c, http.StatusNotFound, "账号不在运行时池中")
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 45*time.Second)
 	defer cancel()
 
-	if err := h.store.RefreshSingle(ctx, id); err != nil {
+	if h.refreshAccount == nil {
+		writeError(c, http.StatusServiceUnavailable, "刷新服务未初始化")
+		return
+	}
+
+	if err := h.refreshAccount(ctx, id); err != nil {
 		switch {
+		case strings.Contains(err.Error(), "不存在"):
+			writeError(c, http.StatusNotFound, err.Error())
 		case errors.Is(err, context.DeadlineExceeded), errors.Is(ctx.Err(), context.DeadlineExceeded):
 			writeError(c, http.StatusGatewayTimeout, "刷新超时，请稍后重试")
 		case errors.Is(err, context.Canceled), errors.Is(ctx.Err(), context.Canceled):
 			writeError(c, http.StatusRequestTimeout, "刷新已取消")
 		default:
-			writeError(c, http.StatusBadGateway, "刷新失败: "+err.Error())
+			writeError(c, http.StatusInternalServerError, "刷新失败: "+err.Error())
 		}
 		return
 	}
 
-	refreshed := h.store.FindByID(id)
+	var refreshed *auth.Account
+	if h.store != nil {
+		refreshed = h.store.FindByID(id)
+	}
 	if refreshed == nil {
-		writeMessage(c, http.StatusOK, "刷新成功")
+		writeMessage(c, http.StatusOK, "账号刷新成功")
 		return
 	}
 
@@ -911,7 +946,7 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": "刷新成功",
+		"message": "账号刷新成功",
 		"account": accountInfo,
 	})
 }

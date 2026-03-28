@@ -1,3 +1,5 @@
+name: codex2api
+
 services:
   codex2api:
     image: "${CODEX2API_IMAGE:-ghcr.io/zhy0504/codex2api}:${CODEX2API_TAG:?set_CODEX2API_TAG}"
@@ -29,6 +31,7 @@ services:
       POSTGRES_USER: ${DATABASE_USER:-codex2api}
       POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-codex2api}
       POSTGRES_DB: ${DATABASE_NAME:-codex2api}
+      PGDATA: /var/lib/postgresql/data
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - pgdata:/var/lib/postgresql/data
@@ -69,4 +72,6 @@ networks:
 volumes:
   codex2api-secrets:
   pgdata:
+    name: codex2api_pgdata
   redisdata:
+    name: codex2api_redisdata

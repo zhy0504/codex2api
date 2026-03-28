@@ -231,11 +231,20 @@ func (db *DB) EncryptExistingCredentialSecrets(ctx context.Context) (int, error)
 
 	updated := 0
 	for _, item := range updates {
-		if _, err := db.conn.ExecContext(ctx,
-			`UPDATE accounts SET credentials = $1::jsonb, updated_at = NOW() WHERE id = $2`,
-			item.json, item.id,
-		); err != nil {
-			return updated, fmt.Errorf("更新账号 %d 的加密凭据失败: %w", item.id, err)
+		if db.isSQLite() {
+			if _, err := db.conn.ExecContext(ctx,
+				`UPDATE accounts SET credentials = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+				string(item.json), item.id,
+			); err != nil {
+				return updated, fmt.Errorf("更新账号 %d 的加密凭据失败: %w", item.id, err)
+			}
+		} else {
+			if _, err := db.conn.ExecContext(ctx,
+				`UPDATE accounts SET credentials = $1::jsonb, updated_at = NOW() WHERE id = $2`,
+				item.json, item.id,
+			); err != nil {
+				return updated, fmt.Errorf("更新账号 %d 的加密凭据失败: %w", item.id, err)
+			}
 		}
 		updated++
 	}

@@ -190,6 +190,12 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 		redisIdle = poolStats.IdleConns
 		redisStale = poolStats.StaleConns
 		redisPoolSize = h.cache.PoolSize()
+		if h.cacheDriver == "" {
+			h.cacheDriver = h.cache.Driver()
+		}
+		if h.cacheLabel == "" {
+			h.cacheLabel = h.cache.Label()
+		}
 
 		activeRedis := int(redisTotal) - int(redisIdle) - int(redisStale)
 		if activeRedis < 0 {
@@ -198,6 +204,13 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 		if redisPoolSize > 0 {
 			redisUsage = float64(activeRedis) / float64(redisPoolSize) * 100
 		}
+	}
+
+	if h.databaseDriver == "" {
+		h.databaseDriver = h.db.Driver()
+	}
+	if h.databaseLabel == "" {
+		h.databaseLabel = h.db.Label()
 	}
 
 	usedMemory, totalMemory, memoryPercent := readSystemMemory()
@@ -211,8 +224,12 @@ func (h *Handler) GetOpsOverview(c *gin.Context) {
 	}
 
 	c.JSON(200, opsOverviewResponse{
-		UpdatedAt:     time.Now().Format(time.RFC3339),
-		UptimeSeconds: int64(time.Since(h.startedAt).Seconds()),
+		UpdatedAt:      time.Now().Format(time.RFC3339),
+		UptimeSeconds:  int64(time.Since(h.startedAt).Seconds()),
+		DatabaseDriver: h.databaseDriver,
+		DatabaseLabel:  h.databaseLabel,
+		CacheDriver:    h.cacheDriver,
+		CacheLabel:     h.cacheLabel,
 		CPU: opsCPUResponse{
 			Percent: cpuPercent,
 			Cores:   runtime.NumCPU(),

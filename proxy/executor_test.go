@@ -125,7 +125,7 @@ func TestShouldTransparentRetryStream(t *testing.T) {
 	if !shouldTransparentRetryStream(retryable, 0, false, nil, nil) {
 		t.Fatal("expected early upstream failure to be transparently retried")
 	}
-	if shouldTransparentRetryStream(retryable, maxRetries, false, nil, nil) {
+	if shouldTransparentRetryStream(retryable, 2, false, nil, nil) {
 		t.Fatal("expected retry to stop at maxRetries")
 	}
 	if shouldTransparentRetryStream(retryable, 0, true, nil, nil) {

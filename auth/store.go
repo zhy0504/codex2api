@@ -6,6 +6,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -660,7 +661,7 @@ func (a *Account) GetLastUsedAt() time.Time {
 	return time.Unix(0, nano)
 }
 
-// Store 多账号管理器（PG + Redis）
+// Store 多账号管理器（数据库 + Token 缓存）
 type Store struct {
 	mu                    sync.RWMutex
 	accounts              []*Account
@@ -669,7 +670,7 @@ type Store struct {
 	testConcurrency       int64        // 批量测试并发数
 	testModel             atomic.Value // 测试连接使用的模型（string）
 	db                    *database.DB
-	tokenCache            *cache.TokenCache
+	tokenCache            cache.TokenCache
 	usageProbeMu          sync.RWMutex
 	usageProbe            func(context.Context, *Account) error
 	usageProbeBatch       atomic.Bool
@@ -678,6 +679,7 @@ type Store struct {
 	autoCleanRateLimited  atomic.Bool
 	autoCleanFullUsage    atomic.Bool
 	autoCleanupBatch      atomic.Bool
+	maxRetries            int64 // 请求失败最大重试次数（换号重试）
 	stopCh                chan struct{}
 	wg                    sync.WaitGroup
 
@@ -685,10 +687,34 @@ type Store struct {
 	proxyPool        []string // 已启用的代理 URL 列表
 	proxyPoolEnabled bool     // 代理池是否开启
 	proxyRoundRobin  uint64   // 轮询计数器
+
+	// Fast scheduler POC（默认关闭，通过环境变量启用）
+	fastScheduler        atomic.Pointer[FastScheduler]
+	fastSchedulerEnabled atomic.Bool
+
+	allowRemoteMigration atomic.Bool // 是否允许远程迁移拉取账号
+}
+
+func fastSchedulerEnabledFromEnv() bool {
+	for _, key := range []string{"FAST_SCHEDULER_ENABLED", "CODEX_FAST_SCHEDULER"} {
+		if truthyEnv(os.Getenv(key)) {
+			return true
+		}
+	}
+	return false
+}
+
+func truthyEnv(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on", "enable", "enabled":
+		return true
+	default:
+		return false
+	}
 }
 
 // NewStore 创建账号管理器
-func NewStore(db *database.DB, tc *cache.TokenCache, settings *database.SystemSettings) *Store {
+func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSettings) *Store {
 	if settings == nil {
 		settings = &database.SystemSettings{
 			MaxConcurrency:  2,
@@ -710,6 +736,19 @@ func NewStore(db *database.DB, tc *cache.TokenCache, settings *database.SystemSe
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
 	s.autoCleanFullUsage.Store(settings.AutoCleanFullUsage)
+	retries := int64(settings.MaxRetries)
+	if retries <= 0 {
+		retries = 2 // 默认重试 2 次
+	}
+	atomic.StoreInt64(&s.maxRetries, retries)
+	s.allowRemoteMigration.Store(settings.AllowRemoteMigration)
+	// 环境变量优先，否则读数据库设置
+	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
+	s.fastSchedulerEnabled.Store(fastEnabled)
+	if fastEnabled {
+		s.fastScheduler.Store(NewFastScheduler(int64(settings.MaxConcurrency)))
+		log.Printf("快速调度器已启用（请求热路径将优先走本地内存调度器）")
+	}
 
 	// 加载代理池
 	if settings.ProxyPoolEnabled {
@@ -726,6 +765,79 @@ func NewStore(db *database.DB, tc *cache.TokenCache, settings *database.SystemSe
 	}
 
 	return s
+}
+
+func (s *Store) getFastScheduler() *FastScheduler {
+	if s == nil || !s.fastSchedulerEnabled.Load() {
+		return nil
+	}
+	return s.fastScheduler.Load()
+}
+
+func (s *Store) rebuildFastScheduler() {
+	if s == nil || !s.fastSchedulerEnabled.Load() {
+		return
+	}
+	s.fastScheduler.Store(s.BuildFastScheduler())
+}
+
+func (s *Store) recomputeAllAccountSchedulerState() {
+	if s == nil {
+		return
+	}
+	baseLimit := atomic.LoadInt64(&s.maxConcurrency)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, acc := range s.accounts {
+		if acc == nil {
+			continue
+		}
+		acc.mu.Lock()
+		acc.recomputeSchedulerLocked(baseLimit)
+		acc.mu.Unlock()
+	}
+}
+
+func (s *Store) fastSchedulerUpdate(acc *Account) {
+	if s == nil || acc == nil {
+		return
+	}
+	scheduler := s.getFastScheduler()
+	if scheduler == nil {
+		return
+	}
+	scheduler.Update(acc)
+}
+
+func (s *Store) fastSchedulerRemove(dbID int64) {
+	if s == nil || dbID == 0 {
+		return
+	}
+	scheduler := s.getFastScheduler()
+	if scheduler == nil {
+		return
+	}
+	scheduler.Remove(dbID)
+}
+
+func (s *Store) SetFastSchedulerEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.fastSchedulerEnabled.Store(enabled)
+	if enabled {
+		s.recomputeAllAccountSchedulerState()
+		s.rebuildFastScheduler()
+		return
+	}
+	s.fastScheduler.Store(nil)
+}
+
+func (s *Store) FastSchedulerEnabled() bool {
+	if s == nil {
+		return false
+	}
+	return s.fastSchedulerEnabled.Load()
 }
 
 // GetProxyURL 获取全局代理地址
@@ -819,7 +931,7 @@ func (s *Store) SetAutoCleanFullUsage(enabled bool) {
 	s.autoCleanFullUsage.Store(enabled)
 }
 
-// Init 初始化：从 PG 加载账号
+// Init 初始化：从数据库加载账号
 func (s *Store) Init(ctx context.Context) error {
 	// 1. 从 PG 加载账号
 	if err := s.loadFromDB(ctx); err != nil {
@@ -833,6 +945,7 @@ func (s *Store) Init(ctx context.Context) error {
 
 	// 2. 并行刷新所有账号的 AT
 	s.parallelRefreshAll(ctx)
+	s.rebuildFastScheduler()
 
 	successCount := 0
 	for _, acc := range s.accounts {
@@ -850,7 +963,7 @@ func (s *Store) Init(ctx context.Context) error {
 	return nil
 }
 
-// loadFromDB 从 PostgreSQL 加载账号
+// loadFromDB 从数据库加载账号
 func (s *Store) loadFromDB(ctx context.Context) error {
 	rows, err := s.db.ListActive(ctx)
 	if err != nil {
@@ -1009,6 +1122,10 @@ func (s *Store) CleanByRuntimeStatus(ctx context.Context, targetStatus string) i
 
 // Next 获取下一个可用账号（健康优先 + 低负载择优 + warm 公平调度）
 func (s *Store) Next() *Account {
+	if scheduler := s.getFastScheduler(); scheduler != nil {
+		return scheduler.Acquire()
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -1100,17 +1217,46 @@ func (s *Store) Release(acc *Account) {
 	if acc == nil {
 		return
 	}
+	if scheduler := s.getFastScheduler(); scheduler != nil {
+		scheduler.Release(acc)
+		return
+	}
 	atomic.AddInt64(&acc.ActiveRequests, -1)
 }
 
 // SetMaxConcurrency 动态更新每账号并发上限
 func (s *Store) SetMaxConcurrency(n int) {
 	atomic.StoreInt64(&s.maxConcurrency, int64(n))
+	s.recomputeAllAccountSchedulerState()
+	s.rebuildFastScheduler()
 }
 
 // GetMaxConcurrency 获取当前每账号并发上限
 func (s *Store) GetMaxConcurrency() int {
 	return int(atomic.LoadInt64(&s.maxConcurrency))
+}
+
+// SetMaxRetries 动态更新最大重试次数
+func (s *Store) SetMaxRetries(n int) {
+	if n < 0 {
+		n = 0
+	}
+	atomic.StoreInt64(&s.maxRetries, int64(n))
+}
+
+// GetMaxRetries 获取当前最大重试次数
+func (s *Store) GetMaxRetries() int {
+	return int(atomic.LoadInt64(&s.maxRetries))
+}
+
+// GetAllowRemoteMigration 获取是否允许远程迁移
+func (s *Store) GetAllowRemoteMigration() bool {
+	return s.allowRemoteMigration.Load()
+}
+
+// SetAllowRemoteMigration 设置是否允许远程迁移
+func (s *Store) SetAllowRemoteMigration(enabled bool) {
+	s.allowRemoteMigration.Store(enabled)
 }
 
 // SetTestModel 动态更新测试连接模型
@@ -1138,9 +1284,16 @@ func (s *Store) GetTestConcurrency() int {
 
 // AddAccount 热加载新账号到内存池（前端添加后即刻生效）
 func (s *Store) AddAccount(acc *Account) {
+	if acc == nil {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	acc.mu.Lock()
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
 	s.accounts = append(s.accounts, acc)
+	s.fastSchedulerUpdate(acc)
 }
 
 // RemoveAccount 从内存池移除账号
@@ -1151,6 +1304,7 @@ func (s *Store) RemoveAccount(dbID int64) {
 	for i, acc := range s.accounts {
 		if acc.DBID == dbID {
 			s.accounts = append(s.accounts[:i], s.accounts[i+1:]...)
+			s.fastSchedulerRemove(dbID)
 			return
 		}
 	}
@@ -1204,6 +1358,7 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 
 	until := now.Add(duration)
 	acc.SetCooldownUntil(until, reason)
+	s.fastSchedulerUpdate(acc)
 
 	if s.db == nil {
 		return
@@ -1234,6 +1389,7 @@ func (s *Store) ClearCooldown(acc *Account) {
 	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
 
 	if s.db == nil {
 		return
@@ -1253,8 +1409,6 @@ func (s *Store) ReportRequestSuccess(acc *Account, latency time.Duration) {
 	}
 
 	acc.mu.Lock()
-	defer acc.mu.Unlock()
-
 	acc.recordLatencyLocked(latency)
 	acc.recordResultLocked(true)
 	acc.LastSuccessAt = time.Now()
@@ -1264,6 +1418,8 @@ func (s *Store) ReportRequestSuccess(acc *Account, latency time.Duration) {
 		acc.HealthTier = HealthTierHealthy
 	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
 }
 
 // ReportRequestFailure 记录一次失败请求，用于动态调度评分
@@ -1274,8 +1430,6 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 
 	now := time.Now()
 	acc.mu.Lock()
-	defer acc.mu.Unlock()
-
 	acc.recordLatencyLocked(latency)
 	acc.recordResultLocked(false)
 	acc.LastFailureAt = now
@@ -1313,6 +1467,8 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 	}
 
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
 }
 
 // PersistUsageSnapshot 持久化账号用量快照（7d + 5h）
@@ -1654,7 +1810,7 @@ func (s *Store) parallelRefreshAll(ctx context.Context) {
 	wg.Wait()
 }
 
-// refreshAccount 刷新单个账号的 AT（带 Redis 锁和缓存）
+// refreshAccount 刷新单个账号的 AT（带缓存锁与 token 缓存）
 func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	acc.mu.RLock()
 	rt := acc.RefreshToken
@@ -1666,7 +1822,7 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	expiredCooldown := acc.Status == StatusCooldown && !time.Now().Before(acc.CooldownUtil)
 	acc.mu.RUnlock()
 
-	// 1. 尝试从 Redis 缓存读取 AT
+	// 1. 尝试从缓存读取 AT
 	cachedToken, err := s.tokenCache.GetAccessToken(ctx, dbID)
 	if err == nil && cachedToken != "" {
 		acc.mu.Lock()
@@ -1685,13 +1841,14 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 		}
 		acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 		acc.mu.Unlock()
+		s.fastSchedulerUpdate(acc)
 		if expiredCooldown {
 			_ = s.db.ClearCooldown(ctx, dbID)
 		}
 		return nil
 	}
 
-	// 2. 获取分布式刷新锁
+	// 2. 获取刷新锁
 	acquired, lockErr := s.tokenCache.AcquireRefreshLock(ctx, dbID, 30*time.Second)
 	if lockErr != nil {
 		log.Printf("[账号 %d] 获取刷新锁失败: %v", dbID, lockErr)
@@ -1714,6 +1871,7 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 			}
 			acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 			acc.mu.Unlock()
+			s.fastSchedulerUpdate(acc)
 			if expiredCooldown {
 				_ = s.db.ClearCooldown(ctx, dbID)
 			}
@@ -1731,6 +1889,7 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 			acc.Status = StatusError
 			acc.ErrorMsg = err.Error()
 			acc.mu.Unlock()
+			s.fastSchedulerUpdate(acc)
 
 			_ = s.db.SetError(ctx, dbID, err.Error())
 		}
@@ -1759,14 +1918,15 @@ func (s *Store) refreshAccount(ctx context.Context, acc *Account) error {
 	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
 
-	// 5. 写入 Redis 缓存
+	// 5. 写入缓存
 	ttl := time.Until(td.ExpiresAt) - 5*time.Minute
 	if ttl > 0 {
 		_ = s.tokenCache.SetAccessToken(ctx, dbID, td.AccessToken, ttl)
 	}
 
-	// 6. 更新 PG credentials
+	// 6. 更新数据库 credentials
 	credentials := map[string]interface{}{
 		"refresh_token": td.RefreshToken,
 		"access_token":  td.AccessToken,

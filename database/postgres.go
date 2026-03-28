@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
+	_ "modernc.org/sqlite"
 )
 
 // AccountRow 数据库中的账号行
@@ -52,6 +54,8 @@ func (a *AccountRow) GetCredential(key string) string {
 type DB struct {
 	conn *sql.DB
 
+	driver string
+
 	credentialCipher *credentialCipher
 
 	// 使用日志批量写入缓冲
@@ -84,18 +88,28 @@ type usageLogEntry struct {
 }
 
 // New 创建数据库连接并自动建表
-func New(dsn string) (*DB, error) {
-	conn, err := sql.Open("postgres", dsn)
+func New(args ...string) (*DB, error) {
+	driver, dsn, err := parseNewArgs(args...)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := sql.Open(driver, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("连接数据库失败: %w", err)
 	}
 
 	// ==================== 连接池优化 ====================
-	// 高并发场景：大量 RT 刷新 + 前端查询 + 使用日志写入 并行
-	conn.SetMaxOpenConns(50)                  // 最大打开连接数（默认无限制，限制避免 PG too many connections）
-	conn.SetMaxIdleConns(25)                  // 空闲连接数（保持足够的热连接避免频繁建连）
-	conn.SetConnMaxLifetime(30 * time.Minute) // 连接最大生存时间（避免长连接僵死）
-	conn.SetConnMaxIdleTime(10 * time.Minute) // 空闲连接最大闲置时间
+	if driver == "sqlite" {
+		conn.SetMaxOpenConns(1)
+		conn.SetMaxIdleConns(1)
+	} else {
+		// 高并发场景：大量 RT 刷新 + 前端查询 + 使用日志写入 并行
+		conn.SetMaxOpenConns(50)                  // 最大打开连接数（默认无限制，限制避免 PG too many connections）
+		conn.SetMaxIdleConns(25)                  // 空闲连接数（保持足够的热连接避免频繁建连）
+		conn.SetConnMaxLifetime(30 * time.Minute) // 连接最大生存时间（避免长连接僵死）
+		conn.SetConnMaxIdleTime(10 * time.Minute) // 空闲连接最大闲置时间
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -106,16 +120,25 @@ func New(dsn string) (*DB, error) {
 
 	db := &DB{
 		conn:    conn,
+		driver:  driver,
 		logStop: make(chan struct{}),
 	}
-	if err := db.migrate(ctx); err != nil {
+
+	if driver == "sqlite" {
+		if err := db.configureSQLite(ctx); err != nil {
+			return nil, fmt.Errorf("SQLite 配置失败: %w", err)
+		}
+		if err := db.migrateSQLite(ctx); err != nil {
+			return nil, fmt.Errorf("数据库迁移失败: %w", err)
+		}
+	} else if err := db.migrate(ctx); err != nil {
 		return nil, fmt.Errorf("数据库迁移失败: %w", err)
 	}
 
 	// 启动批量写入后台协程
 	db.startLogFlusher()
 
-	_, err = db.conn.ExecContext(ctx, `
+	baselineDDL := `
 		CREATE TABLE IF NOT EXISTS usage_stats_baseline (
 			id              INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
 			total_requests  BIGINT NOT NULL DEFAULT 0,
@@ -124,20 +147,63 @@ func New(dsn string) (*DB, error) {
 			completion_tokens BIGINT NOT NULL DEFAULT 0,
 			cached_tokens   BIGINT NOT NULL DEFAULT 0
 		)
-	`)
+	`
+	if driver == "sqlite" {
+		baselineDDL = `
+			CREATE TABLE IF NOT EXISTS usage_stats_baseline (
+				id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+				total_requests INTEGER NOT NULL DEFAULT 0,
+				total_tokens INTEGER NOT NULL DEFAULT 0,
+				prompt_tokens INTEGER NOT NULL DEFAULT 0,
+				completion_tokens INTEGER NOT NULL DEFAULT 0,
+				cached_tokens INTEGER NOT NULL DEFAULT 0
+			)
+		`
+	}
+
+	_, err = db.conn.ExecContext(ctx, baselineDDL)
 	if err != nil {
 		return nil, fmt.Errorf("创建 usage_stats_baseline 表失败: %w", err)
 	}
 
 	// 确保 baseline 行存在
-	_, err = db.conn.ExecContext(ctx, `
-		INSERT INTO usage_stats_baseline (id) VALUES (1) ON CONFLICT DO NOTHING
-	`)
+	if driver == "sqlite" {
+		_, err = db.conn.ExecContext(ctx, `INSERT OR IGNORE INTO usage_stats_baseline (id) VALUES (1)`)
+	} else {
+		_, err = db.conn.ExecContext(ctx, `
+			INSERT INTO usage_stats_baseline (id) VALUES (1) ON CONFLICT DO NOTHING
+		`)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("初始化 usage_stats_baseline 失败: %w", err)
 	}
 
 	return db, nil
+}
+
+func parseNewArgs(args ...string) (driver string, dsn string, err error) {
+	if len(args) == 0 {
+		return "", "", fmt.Errorf("缺少数据库连接参数")
+	}
+	if len(args) == 1 {
+		return "postgres", strings.TrimSpace(args[0]), nil
+	}
+
+	driver = normalizeDriver(args[0])
+	if driver == "sqlite" {
+		path := strings.TrimSpace(args[1])
+		if path == "" {
+			return "", "", fmt.Errorf("sqlite 数据库路径不能为空")
+		}
+		if !strings.HasPrefix(path, "file:") {
+			if abs, absErr := filepath.Abs(path); absErr == nil {
+				path = abs
+			}
+		}
+		return "sqlite", path, nil
+	}
+
+	return "postgres", strings.TrimSpace(args[1]), nil
 }
 
 // Close 关闭数据库连接
@@ -151,6 +217,15 @@ func (db *DB) Close() error {
 
 // SetMaxOpenConns 运行时调整最大连接数（管理后台调用）
 func (db *DB) SetMaxOpenConns(n int) {
+	if db == nil || db.conn == nil {
+		return
+	}
+	if db.isSQLite() {
+		// SQLite 单文件模式下保持单连接，避免写锁竞争。
+		db.conn.SetMaxOpenConns(1)
+		db.conn.SetMaxIdleConns(1)
+		return
+	}
 	db.conn.SetMaxOpenConns(n)
 	db.conn.SetMaxIdleConns(n / 2)
 }
@@ -243,6 +318,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS admin_secret VARCHAR(255) DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_clean_full_usage BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS proxy_pool_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_scheduler_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS max_retries INT DEFAULT 2;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS allow_remote_migration BOOLEAN DEFAULT FALSE;
 
 	CREATE TABLE IF NOT EXISTS proxies (
 		id         SERIAL PRIMARY KEY,
@@ -271,6 +349,10 @@ type APIKeyRow struct {
 
 // ListAPIKeys 获取所有 API 密钥
 func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
+	if db.isSQLite() {
+		return db.listAPIKeysSQLite(ctx)
+	}
+
 	rows, err := db.conn.QueryContext(ctx, `SELECT id, name, key, created_at FROM api_keys ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -290,6 +372,10 @@ func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
 
 // InsertAPIKey 插入新 API 密钥
 func (db *DB) InsertAPIKey(ctx context.Context, name, key string) (int64, error) {
+	if db.isSQLite() {
+		return db.insertAPIKeySQLite(ctx, name, key)
+	}
+
 	var id int64
 	err := db.conn.QueryRowContext(ctx,
 		`INSERT INTO api_keys (name, key) VALUES ($1, $2) RETURNING id`, name, key).Scan(&id)
@@ -312,20 +398,28 @@ type SystemSettings struct {
 	AdminSecret           string
 	AutoCleanFullUsage    bool
 	ProxyPoolEnabled      bool
+	FastSchedulerEnabled  bool
+	MaxRetries            int
+	AllowRemoteMigration  bool
 }
 
 // GetSystemSettings 加载全局设置
 func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
+	if db.isSQLite() {
+		return db.getSystemSettingsSQLite(ctx)
+	}
+
 	s := &SystemSettings{}
 	err := db.conn.QueryRowContext(ctx, `
 		SELECT max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 		       auto_clean_unauthorized, auto_clean_rate_limited, COALESCE(admin_secret, ''), COALESCE(auto_clean_full_usage, false),
-		       COALESCE(proxy_pool_enabled, false)
+		       COALESCE(proxy_pool_enabled, false), COALESCE(fast_scheduler_enabled, false), COALESCE(max_retries, 2),
+		       COALESCE(allow_remote_migration, false)
 		FROM system_settings WHERE id = 1
 	`).Scan(
 		&s.MaxConcurrency, &s.GlobalRPM, &s.TestModel, &s.TestConcurrency, &s.ProxyURL, &s.PgMaxConns, &s.RedisPoolSize,
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
-		&s.ProxyPoolEnabled,
+		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.AllowRemoteMigration,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -335,12 +429,17 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 
 // UpdateSystemSettings 更新全局设置（upsert：无行时自动插入）
 func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error {
+	if db.isSQLite() {
+		return db.updateSystemSettingsSQLite(ctx, s)
+	}
+
 	_, err := db.conn.ExecContext(ctx, `
 		INSERT INTO system_settings (
 			id, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
-			auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled
+			auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
+			fast_scheduler_enabled, max_retries, allow_remote_migration
 		)
-		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		ON CONFLICT (id) DO UPDATE SET
 			max_concurrency         = EXCLUDED.max_concurrency,
 			global_rpm              = EXCLUDED.global_rpm,
@@ -353,20 +452,32 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 			auto_clean_rate_limited = EXCLUDED.auto_clean_rate_limited,
 			admin_secret            = EXCLUDED.admin_secret,
 			auto_clean_full_usage   = EXCLUDED.auto_clean_full_usage,
-			proxy_pool_enabled      = EXCLUDED.proxy_pool_enabled
+			proxy_pool_enabled      = EXCLUDED.proxy_pool_enabled,
+			fast_scheduler_enabled  = EXCLUDED.fast_scheduler_enabled,
+			max_retries             = EXCLUDED.max_retries,
+			allow_remote_migration  = EXCLUDED.allow_remote_migration
 	`, s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
-		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled)
+		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
+		s.FastSchedulerEnabled, s.MaxRetries, s.AllowRemoteMigration)
 	return err
 }
 
 // DeleteAPIKey 删除 API 密钥
 func (db *DB) DeleteAPIKey(ctx context.Context, id int64) error {
+	if db.isSQLite() {
+		return db.deleteAPIKeySQLite(ctx, id)
+	}
+
 	_, err := db.conn.ExecContext(ctx, `DELETE FROM api_keys WHERE id = $1`, id)
 	return err
 }
 
 // GetAllAPIKeyValues 获取所有密钥值（用于鉴权）
 func (db *DB) GetAllAPIKeyValues(ctx context.Context) ([]string, error) {
+	if db.isSQLite() {
+		return db.getAllAPIKeyValuesSQLite(ctx)
+	}
+
 	rows, err := db.conn.QueryContext(ctx, `SELECT key FROM api_keys`)
 	if err != nil {
 		return nil, err
@@ -400,6 +511,10 @@ type ProxyRow struct {
 
 // ListProxies 获取所有代理
 func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
+	if db.isSQLite() {
+		return db.listProxiesSQLite(ctx)
+	}
+
 	rows, err := db.conn.QueryContext(ctx, `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -419,6 +534,10 @@ func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
 
 // ListEnabledProxies 获取已启用的代理
 func (db *DB) ListEnabledProxies(ctx context.Context) ([]*ProxyRow, error) {
+	if db.isSQLite() {
+		return db.listEnabledProxiesSQLite(ctx)
+	}
+
 	rows, err := db.conn.QueryContext(ctx, `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0) FROM proxies WHERE enabled = true ORDER BY id`)
 	if err != nil {
 		return nil, err
@@ -438,6 +557,10 @@ func (db *DB) ListEnabledProxies(ctx context.Context) ([]*ProxyRow, error) {
 
 // InsertProxy 插入单个代理
 func (db *DB) InsertProxy(ctx context.Context, url, label string) (int64, error) {
+	if db.isSQLite() {
+		return db.insertProxySQLite(ctx, url, label)
+	}
+
 	var id int64
 	err := db.conn.QueryRowContext(ctx,
 		`INSERT INTO proxies (url, label) VALUES ($1, $2) ON CONFLICT (url) DO NOTHING RETURNING id`, url, label).Scan(&id)
@@ -446,6 +569,10 @@ func (db *DB) InsertProxy(ctx context.Context, url, label string) (int64, error)
 
 // InsertProxies 批量插入代理（跳过已存在的）
 func (db *DB) InsertProxies(ctx context.Context, urls []string, label string) (int, error) {
+	if db.isSQLite() {
+		return db.insertProxiesSQLite(ctx, urls, label)
+	}
+
 	inserted := 0
 	for _, u := range urls {
 		var id int64
@@ -460,12 +587,20 @@ func (db *DB) InsertProxies(ctx context.Context, urls []string, label string) (i
 
 // DeleteProxy 删除单个代理
 func (db *DB) DeleteProxy(ctx context.Context, id int64) error {
+	if db.isSQLite() {
+		return db.deleteProxySQLite(ctx, id)
+	}
+
 	_, err := db.conn.ExecContext(ctx, `DELETE FROM proxies WHERE id = $1`, id)
 	return err
 }
 
 // DeleteProxies 批量删除代理
 func (db *DB) DeleteProxies(ctx context.Context, ids []int64) (int, error) {
+	if db.isSQLite() {
+		return db.deleteProxiesSQLite(ctx, ids)
+	}
+
 	if len(ids) == 0 {
 		return 0, nil
 	}
@@ -487,6 +622,10 @@ func (db *DB) DeleteProxies(ctx context.Context, ids []int64) (int, error) {
 
 // UpdateProxy 更新代理
 func (db *DB) UpdateProxy(ctx context.Context, id int64, label *string, enabled *bool) error {
+	if db.isSQLite() {
+		return db.updateProxySQLite(ctx, id, label, enabled)
+	}
+
 	if label != nil {
 		if _, err := db.conn.ExecContext(ctx, `UPDATE proxies SET label = $1 WHERE id = $2`, *label, id); err != nil {
 			return err
@@ -502,6 +641,10 @@ func (db *DB) UpdateProxy(ctx context.Context, id int64, label *string, enabled 
 
 // UpdateProxyTestResult 更新代理测试结果
 func (db *DB) UpdateProxyTestResult(ctx context.Context, id int64, ip, location string, latencyMs int) error {
+	if db.isSQLite() {
+		return db.updateProxyTestResultSQLite(ctx, id, ip, location, latencyMs)
+	}
+
 	_, err := db.conn.ExecContext(ctx,
 		`UPDATE proxies SET test_ip = $1, test_location = $2, test_latency_ms = $3 WHERE id = $4`,
 		ip, location, latencyMs, id)
@@ -537,6 +680,10 @@ type UsageLog struct {
 
 // InsertUsageLog 将日志追加到内存缓冲（非阻塞）
 func (db *DB) InsertUsageLog(ctx context.Context, log *UsageLogInput) error {
+	if db.isSQLite() {
+		return db.insertUsageLogSQLite(ctx, log)
+	}
+
 	db.logMu.Lock()
 	db.logBuf = append(db.logBuf, usageLogEntry{
 		AccountID:        log.AccountID,
@@ -682,6 +829,10 @@ type TrafficSnapshot struct {
 
 // GetUsageStats 获取使用统计（基线 + 当前日志）
 func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
+	if db.isSQLite() {
+		return db.getUsageStatsSQLite(ctx)
+	}
+
 	stats := &UsageStats{}
 
 	// 只扫描今日数据（走 idx_usage_logs_created_at 索引，极快）
@@ -743,6 +894,10 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 
 // GetTrafficSnapshot 获取近实时流量快照
 func (db *DB) GetTrafficSnapshot(ctx context.Context) (*TrafficSnapshot, error) {
+	if db.isSQLite() {
+		return db.getTrafficSnapshotSQLite(ctx)
+	}
+
 	snapshot := &TrafficSnapshot{}
 	query := `
 	WITH per_second AS (
@@ -784,6 +939,10 @@ func (db *DB) GetTrafficSnapshot(ctx context.Context) (*TrafficSnapshot, error) 
 
 // ListRecentUsageLogs 获取最近的请求日志
 func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, error) {
+	if db.isSQLite() {
+		return db.listRecentUsageLogsSQLite(ctx, limit)
+	}
+
 	if limit <= 0 || limit > 5000 {
 		limit = 50
 	}
@@ -862,6 +1021,9 @@ type AccountUsageDetail struct {
 func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, bucketMinutes int) (*ChartAggregation, error) {
 	if bucketMinutes < 1 {
 		bucketMinutes = 5
+	}
+	if db.isSQLite() {
+		return db.getChartAggregationSQLite(ctx, start, end, bucketMinutes)
 	}
 	result := &ChartAggregation{}
 
@@ -989,6 +1151,10 @@ func (db *DB) GetAccountUsageStats(ctx context.Context, accountID int64) (*Accou
 
 // ListUsageLogsByTimeRange 按时间范围查询请求日志
 func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time) ([]*UsageLog, error) {
+	if db.isSQLite() {
+		return db.listUsageLogsByTimeRangeSQLite(ctx, start, end)
+	}
+
 	query := `SELECT u.id, u.account_id, u.endpoint, u.model, u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
@@ -1039,6 +1205,10 @@ type UsageLogFilter struct {
 
 // ListUsageLogsByTimeRangePaged 按时间范围分页查询请求日志（支持筛选）
 func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilter) (*UsageLogPage, error) {
+	if db.isSQLite() {
+		return db.listUsageLogsByTimeRangePagedSQLite(ctx, f)
+	}
+
 	if f.Page < 1 {
 		f.Page = 1
 	}
@@ -1117,6 +1287,10 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 
 // ClearUsageLogs 清空所有使用日志（先快照累计值到基线表）
 func (db *DB) ClearUsageLogs(ctx context.Context) error {
+	if db.isSQLite() {
+		return db.clearUsageLogsSQLite(ctx)
+	}
+
 	// 先将当前日志的累计值叠加到基线表
 	_, err := db.conn.ExecContext(ctx, `
 		UPDATE usage_stats_baseline SET
@@ -1150,6 +1324,10 @@ type AccountRequestCount struct {
 
 // GetAccountRequestCounts 按 account_id 聚合成功/失败请求数
 func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRequestCount, error) {
+	if db.isSQLite() {
+		return db.getAccountRequestCountsSQLite(ctx)
+	}
+
 	query := `
 	SELECT account_id,
 		COUNT(*) FILTER (WHERE status_code < 400) AS success_count,
@@ -1177,6 +1355,10 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 
 // ListActive 获取所有状态为 active 的账号
 func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
+	if db.isSQLite() {
+		return db.listActiveSQLite(ctx)
+	}
+
 	query := `
 		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, created_at, updated_at
 		FROM accounts
@@ -1222,6 +1404,10 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 // UpdateCredentials 原子合并更新账号的 credentials（JSONB || 运算符，不覆盖已有字段）
 // 解决并发刷新时一个进程覆盖另一个进程写入的字段的问题
 func (db *DB) UpdateCredentials(ctx context.Context, id int64, credentials map[string]interface{}) error {
+	if db.isSQLite() {
+		return db.updateCredentialsSQLite(ctx, id, credentials)
+	}
+
 	encCredentials, _, err := db.encryptCredentialMap(credentials)
 	if err != nil {
 		return fmt.Errorf("加密 credentials 失败: %w", err)
@@ -1261,6 +1447,10 @@ func (db *DB) UpdateUsageSnapshotFull(ctx context.Context, id int64, pct7d float
 
 // SetError 标记账号错误状态
 func (db *DB) SetError(ctx context.Context, id int64, errorMsg string) error {
+	if db.isSQLite() {
+		return db.setErrorSQLite(ctx, id, errorMsg)
+	}
+
 	query := `UPDATE accounts SET status = 'error', error_message = $1, cooldown_reason = '', cooldown_until = NULL, updated_at = NOW() WHERE id = $2`
 	_, err := db.conn.ExecContext(ctx, query, errorMsg, id)
 	return err
@@ -1268,6 +1458,10 @@ func (db *DB) SetError(ctx context.Context, id int64, errorMsg string) error {
 
 // ClearError 清除账号错误状态
 func (db *DB) ClearError(ctx context.Context, id int64) error {
+	if db.isSQLite() {
+		return db.clearErrorSQLite(ctx, id)
+	}
+
 	query := `UPDATE accounts SET status = 'active', error_message = '', cooldown_reason = '', cooldown_until = NULL, updated_at = NOW() WHERE id = $1`
 	_, err := db.conn.ExecContext(ctx, query, id)
 	return err
@@ -1275,6 +1469,10 @@ func (db *DB) ClearError(ctx context.Context, id int64) error {
 
 // SetCooldown 持久化账号冷却状态
 func (db *DB) SetCooldown(ctx context.Context, id int64, reason string, until time.Time) error {
+	if db.isSQLite() {
+		return db.setCooldownSQLite(ctx, id, reason, until)
+	}
+
 	query := `UPDATE accounts SET cooldown_reason = $1, cooldown_until = $2, updated_at = NOW() WHERE id = $3`
 	_, err := db.conn.ExecContext(ctx, query, reason, until, id)
 	return err
@@ -1282,6 +1480,10 @@ func (db *DB) SetCooldown(ctx context.Context, id int64, reason string, until ti
 
 // ClearCooldown 清除账号冷却状态
 func (db *DB) ClearCooldown(ctx context.Context, id int64) error {
+	if db.isSQLite() {
+		return db.clearCooldownSQLite(ctx, id)
+	}
+
 	query := `UPDATE accounts SET cooldown_reason = '', cooldown_until = NULL, updated_at = NOW() WHERE id = $1`
 	_, err := db.conn.ExecContext(ctx, query, id)
 	return err
@@ -1289,6 +1491,10 @@ func (db *DB) ClearCooldown(ctx context.Context, id int64) error {
 
 // InsertAccount 插入新账号
 func (db *DB) InsertAccount(ctx context.Context, name string, refreshToken string, proxyURL string) (int64, error) {
+	if db.isSQLite() {
+		return db.insertAccountSQLite(ctx, name, refreshToken, proxyURL)
+	}
+
 	credentials := map[string]interface{}{
 		"refresh_token": refreshToken,
 	}
@@ -1310,6 +1516,10 @@ func (db *DB) InsertAccount(ctx context.Context, name string, refreshToken strin
 
 // CountAll 获取账号总数
 func (db *DB) CountAll(ctx context.Context) (int, error) {
+	if db.isSQLite() {
+		return db.countAllSQLite(ctx)
+	}
+
 	var count int
 	err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&count)
 	return count, err
@@ -1317,6 +1527,10 @@ func (db *DB) CountAll(ctx context.Context) (int, error) {
 
 // GetAllRefreshTokens 获取所有已存在的 refresh_token（用于导入去重）
 func (db *DB) GetAllRefreshTokens(ctx context.Context) (map[string]bool, error) {
+	if db.isSQLite() {
+		return db.getAllRefreshTokensSQLite(ctx)
+	}
+
 	rows, err := db.conn.QueryContext(ctx, `SELECT id, credentials FROM accounts WHERE status = 'active'`)
 	if err != nil {
 		return nil, err
