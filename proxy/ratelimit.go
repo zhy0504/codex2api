@@ -13,7 +13,7 @@ type tokenBucket struct {
 	mu         sync.Mutex
 	tokens     float64
 	maxTokens  float64
-	refillRate float64   // 每秒补充的令牌数
+	refillRate float64 // 每秒补充的令牌数
 	lastRefill time.Time
 }
 

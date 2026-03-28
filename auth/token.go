@@ -219,8 +219,6 @@ func buildHTTPClient(proxyURL string) *http.Client {
 	return client
 }
 
-
-
 // BuildHTTPClient builds a proxy-aware HTTP client (exported for admin OAuth flow).
 func BuildHTTPClient(proxyURL string) *http.Client {
 	return buildHTTPClient(proxyURL)
