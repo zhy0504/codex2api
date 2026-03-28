@@ -1136,11 +1136,6 @@ func (db *DB) ClearUsageLogs(ctx context.Context) error {
 	return err
 }
 
-// Ping 检查 PostgreSQL 连通性
-func (db *DB) Ping(ctx context.Context) error {
-	return db.conn.PingContext(ctx)
-}
-
 // Stats 返回 PostgreSQL 连接池状态
 func (db *DB) Stats() sql.DBStats {
 	return db.conn.Stats()
