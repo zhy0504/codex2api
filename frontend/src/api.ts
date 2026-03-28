@@ -30,6 +30,16 @@ export function getAdminKey(): string {
 export function setAdminKey(_key: string) {
 }
 
+// 兼容旧调用方：重置鉴权状态（当前为 Cookie 会话，触发一次后端登出清理）
+export function resetAdminAuthState() {
+  void fetch(`${BASE}/auth/logout`, {
+    method: 'POST',
+    credentials: 'same-origin',
+  }).catch(() => {
+    // ignore cleanup errors; next session check will still enforce login when needed
+  })
+}
+
 function extractAdminErrorMessage(body: string, status: number): string {
   if (!body.trim()) {
     return `HTTP ${status}`
